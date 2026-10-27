@@ -24,7 +24,10 @@ even when it lives on another computer, and in either tool.
 ## Highlights
 
 - **One list for everything.** Every project, newest first, with the session's name, the hours
-  you actually spent in it, and the last thing you asked. Filter by typing.
+  you actually spent in it, and the last thing you asked. Filter by typing, and reach further
+  back in time without leaving the list.
+- **Find anything you ever asked.** `s search` looks through every prompt you wrote, in every
+  session on every machine, however old, and takes you straight back to that conversation.
 - **Claude Code and Codex in one list.** If you also use the Codex CLI, its sessions show up
   beside your Claude ones, and any session can be continued in the other tool. A conversation
   that moved between the two stays one row and opens wherever you worked on it last.
@@ -81,6 +84,25 @@ Jobs scheduled inside a Claude Code session only run while that session is open,
 after a week. That is easy to forget. `s jobs` lists every job you ever set up with its
 schedule, how many of its possible runs have happened, and a plain status: live, waiting,
 done, expired, cancelled, or dead because the terminal closed.
+
+## Find anything you ever asked
+
+<p align="center">
+  <img src="docs/search.svg" width="100%" alt="s search: every conversation with a prompt that has the words">
+</p>
+
+`s search stripe paywall` finds every prompt you wrote with all of those words, in any session,
+on any of your machines, from today back to the oldest transcript on disk. You get one row per
+conversation, with the matching prompt and the words highlighted, newest match first, and a
+number takes you back into it like anywhere else. In the picker, `?stripe paywall` does the same
+without leaving it, and `?` returns to the list.
+
+The first search reads your whole history once, a few seconds. After that a search takes a
+fraction of a second, because `s` keeps an index of your prompts (`~/.cache/sessions/prompts.json`)
+and only reads what was added since.
+
+The list itself covers the last two weeks. Type `o` in the picker (or `n` past the last page) to
+reach further back: 30 days, 90 days, a year, then everything. With fzf it is alt-o.
 
 ## Every detail of a session
 
@@ -244,6 +266,7 @@ deletes nothing.
 | `s 3 --codex` · `s 3 --claude` | continue number 3 in Codex · in Claude Code |
 | `s 1a2b3c4d` | open exactly that session (by id), even one step of a `⇄` chain |
 | `s tiktok` | filter by any word; resumes at once if only one matches |
+| `s search stripe paywall` | every prompt you ever wrote with those words, on every machine |
 | `s running` · `s cron` · `s @studio` | only running sessions, only sessions with jobs, only one machine |
 | `s codex` · `s claude` | only Codex sessions · only Claude Code sessions |
 | `s cost` | spend at API list prices per day, week and month, by model and session |
@@ -260,8 +283,9 @@ deletes nothing.
 | `mem` | what Claude and Codex remember about this folder |
 
 Inside the picker: a number resumes, `c 3` and `x 3` continue in Claude Code or Codex, `s 3`
-shows details, `/text` filters, `n` and `p` page, `q` quits. With fzf: enter resumes, alt-c and
-alt-x continue in Claude Code or Codex.
+shows details, `/text` filters, `?text` searches every prompt, `n` and `p` page, `o` reaches
+further back, `q` quits. With fzf: enter resumes, alt-c and alt-x continue in Claude Code or
+Codex, alt-o reaches further back.
 
 ## Questions
 

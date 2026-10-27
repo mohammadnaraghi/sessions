@@ -435,6 +435,8 @@ def main():
         for s in remote_json:
             if s.get("running"):
                 s["running"]["tmux"] = "main:1.0"
+        remote_search = json.loads(subprocess.run([sys.executable, SCRIPT, "search", "--json", "--local", "--no-codex", "test"],
+                                                  env=env, capture_output=True, text=True, check=True).stdout)
         remote_export = subprocess.run([sys.executable, SCRIPT, "_export", "--items", "memory,configs"], env=env,
                                        capture_output=True, check=True).stdout
 
@@ -466,8 +468,10 @@ def main():
         tool.start_remote = lambda hosts, days: {"hosts": hosts}
         tool.finish_remote = lambda pending, wait=None: [
             (label, [tool.from_json(o, label) for o in remote_json], None) for label in pending["hosts"]]
+        tool.remote_search = lambda hosts, query, timeout=180: [
+            (label, [tool.from_json(o, label) for o in remote_search], None) for label in hosts]
         demo_codex = codex_demo(tool, home_local)
-        tool.load_codex = lambda days, rescan=False: ([dict(s) for s in demo_codex], None)
+        tool.load_codex = lambda days, rescan=False, include=(): ([dict(s) for s in demo_codex], None)
 
         home_re = re.escape(home_local)
 
@@ -476,6 +480,8 @@ def main():
 
         os.makedirs(OUT, exist_ok=True)
         svg(tidy(capture(tool, [], cols=124, lines=22, picker=True)), "s", os.path.join(OUT, "picker.svg"), cols=124)
+        svg(tidy(capture(tool, ["search", "test"], cols=124, lines=16, picker=True)), "s search test",
+            os.path.join(OUT, "search.svg"), cols=124)
         svg(tidy(capture(tool, ["live"])), "s live", os.path.join(OUT, "live.svg"))
         svg(tidy(capture(tool, ["show", "a1b2c3d4-0000-4000-8000-000000000002"])), "s show 2", os.path.join(OUT, "show.svg"))
         svg(tidy(capture(tool, ["jobs"])), "s jobs", os.path.join(OUT, "jobs.svg"))

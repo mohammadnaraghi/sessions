@@ -23,6 +23,9 @@ Usage
   s tiktok               filter by text; resumes directly on a single match
                          ("running", "cron", "claude" and "codex" filter by
                          status or tool, @studio by host)
+  s search WORDS         every prompt you ever wrote, in every session on every
+                         machine, however old: the conversations with a prompt
+                         that has all the words, newest match first, to pick from
   s show 3 | show <id>   details: work per day, prompts, live status, cron jobs
   s cost                 what your sessions would cost at API list prices (not a
                          subscription): bar charts per day, week and month,
@@ -97,8 +100,11 @@ Markers   ● session is running (green = busy, yellow = idle)
           ↻ session set up cron jobs (green = a job is still live)
 
 Inside the picker:  3 = resume #3   c 3 / x 3 = continue #3 in Claude / Codex
-                    s 3 = details   /text = filter
-                    n / p = next / previous page     q = quit
+                    s 3 = details   /text = filter   ?text = search every prompt
+                    n / p = next / previous page (n past the last page and
+                    o reach further back: 30 days, 90, a year, everything)
+                    q = quit
+                    With fzf: alt-c / alt-x continue, alt-o reaches further back.
 """
 import argparse
 import glob
@@ -117,7 +123,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -559,7 +565,9 @@ def parse(path, st):
     return st
 
 
-def load_sessions(days, rescan=False):
+def load_sessions(days, rescan=False, include=()):
+    """This machine's Claude sessions active in the window (or parsed before), and those in
+    `include` (transcript paths) however old."""
     cache = {}
     if not rescan and os.path.exists(CACHE):
         try:
@@ -572,6 +580,7 @@ def load_sessions(days, rescan=False):
     cache["__version__"] = CACHE_VERSION
     horizon = (datetime.now() - timedelta(days=days)).timestamp()
     out, dirty, sub_usage = [], False, {}
+    include_ids = {os.path.basename(p)[:-6] for p in include}
     if not os.path.isdir(PROJECTS):
         return out
 
@@ -583,7 +592,7 @@ def load_sessions(days, rescan=False):
             s = os.stat(path)
             if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
                 st = entry["st"]
-            elif s.st_mtime < horizon and not entry:
+            elif s.st_mtime < horizon and not entry and parent not in include_ids:
                 return
             else:
                 st = (entry["st"] if entry and entry["size"] <= s.st_size
@@ -618,7 +627,7 @@ def load_sessions(days, rescan=False):
                 s = ent.stat()
                 if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
                     st = entry["st"]
-                elif s.st_mtime < horizon and not entry:
+                elif s.st_mtime < horizon and not entry and ent.path not in include:
                     continue  # too old to matter and never parsed
                 else:
                     st = entry["st"] if entry and entry["size"] <= s.st_size else new_state()
@@ -797,12 +806,13 @@ def codex_command(item):
     return str(cmd or "")
 
 
-def codex_events(text):
+def codex_events(text, items=None):
     """A Codex session file as (kind, unix time, value), alike for its older and newer formats:
     start (a turn begins), end (value: start, end, error), model, tokens (token_count info),
     user / agent (message text), tool (the item), call (a raw tool call, for its text). Turns
     Codex imported from a Claude transcript are left out: they are that Claude session's."""
-    items = '"item_completed"' in text  # newer files log every item; older ones only messages
+    if items is None:  # newer files log every item; older ones only messages
+        items = '"item_completed"' in text
     imported = False
     for line in text.splitlines():
         try:
@@ -937,7 +947,7 @@ def codex_parent(row, text):
     return parent if parent and parent != row.get("id") else None
 
 
-def load_codex(days, rescan=False):
+def load_codex(days, rescan=False, include=()):
     """-> (Codex sessions touched in the window, note), from Codex's thread index and session
     files. A thread is read again only when its file changed. Work Codex's subagents and
     reviewers did counts toward the thread they worked for."""
@@ -958,7 +968,9 @@ def load_codex(days, rescan=False):
         if db is None:
             return [], None
         try:
-            rows = [dict(r) for r in db.execute("select * from threads where updated_at >= ?", (int(horizon),))]
+            wanted = sorted(include)
+            rows = [dict(r) for r in db.execute(
+                "select * from threads where updated_at >= ?" + " or id = ?" * len(wanted), [int(horizon), *wanted])]
             try:
                 edges = dict(db.execute("select child_thread_id, parent_thread_id from thread_spawn_edges"))
             except sqlite3.Error:
@@ -985,6 +997,10 @@ def load_codex(days, rescan=False):
             threads[r["id"]] = {"sig": sig, "rollout": path, "child": child, "st": codex_state(r, text),
                                 "parent": (edges.get(r["id"]) or codex_parent(r, text)) if child else None}
             dirty = True
+        listed = {r.get("id") for r in rows}
+        for tid, e in old.items():  # read before for a longer window or a search: still good
+            if tid not in listed and tid not in threads:
+                threads[tid] = e
         if dirty or set(threads) != set(old):
             os.makedirs(CACHE_DIR, exist_ok=True)
             tmp = CODEX_CACHE + ".tmp"
@@ -1279,6 +1295,194 @@ def merge_rows(sessions):
     return rows
 
 
+# ----------------------------------------------------------------- deep search
+
+PROMPT_INDEX = os.path.join(CACHE_DIR, "prompts.json")
+PROMPT_INDEX_VERSION = 2
+PROMPT_KEEP = 4000  # characters kept of each prompt
+CODEX_PROMPT_LINES = (b'"UserMessage"', b'"user_message"', b'"task_started"', b'"item_completed"')
+
+
+def index_claude(path, e):
+    """Add the prompts you wrote into a Claude transcript since e's offset."""
+    with open(path, "rb") as f:
+        f.seek(e["offset"])
+        data = f.read()
+    end = data.rfind(b"\n")
+    if end < 0:
+        return
+    e["offset"] += end + 1
+    for line in data[:end].split(b"\n"):
+        if b'"user"' not in line:  # cheap test before parsing; the type is checked below
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("type") != "user" or o.get("isMeta") or o.get("isCompactSummary") or o.get("isSidechain"):
+            continue
+        txt, ts = prompt_text((o.get("message") or {}).get("content")), parse_ts(o.get("timestamp"))
+        if txt and ts:
+            e["prompts"].append([ts.timestamp(), txt[:PROMPT_KEEP]])
+
+
+def index_codex(path, e):
+    """Add the prompts you wrote into a Codex session file since e's offset (a compressed file
+    is read whole)."""
+    if path.endswith(".zst"):
+        data, e["offset"], e["prompts"] = (read_rollout(path[:-4]) or "").encode(), 0, []
+    else:
+        with open(path, "rb") as f:
+            f.seek(e["offset"])
+            data = f.read()
+    end = data.rfind(b"\n")
+    if end < 0:
+        return
+    if not path.endswith(".zst"):
+        e["offset"] += end + 1
+    lines = [ln for ln in data[:end + 1].split(b"\n") if any(k in ln for k in CODEX_PROMPT_LINES)]
+    text = b"\n".join(lines).decode("utf-8", "ignore")
+    e["items"] = e.get("items") or '"item_completed"' in text
+    for kind, t, v in codex_events(text, e["items"]):
+        txt = clean_part(v or "") if kind == "user" else None
+        if txt and t:
+            e["prompts"].append([t, txt[:PROMPT_KEEP]])
+
+
+def prompt_index():
+    """{"files": {path: {app, id, size, mtime, offset, prompts: [[unix time, text]]}}}: every prompt
+    you wrote in every Claude Code and Codex session on this machine, however old. Kept in
+    ~/.cache/sessions/prompts.json and brought up to date from where each file was last read."""
+    try:
+        with open(PROMPT_INDEX) as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        index = {}
+    if index.get("__version__") != PROMPT_INDEX_VERSION:
+        index = {"__version__": PROMPT_INDEX_VERSION, "files": {}}
+    files, seen, dirty = index["files"], set(), False
+    todo = []
+    if os.path.isdir(PROJECTS):
+        for proj in os.scandir(PROJECTS):
+            if proj.is_dir():
+                for ent in os.scandir(proj.path):
+                    if ent.name.endswith(".jsonl") and not ent.name.startswith("agent-"):
+                        todo.append((ent.path, "claude", ent.name[:-6]))
+    try:
+        db = codex_db()
+    except sqlite3.Error:
+        db = None
+    if db is not None:
+        try:
+            for r in db.execute("select id, rollout_path, source from threads"):
+                src = r["source"] or ""
+                path = rollout_file(r["rollout_path"])
+                if path and not src.startswith("{") and src != "exec":
+                    todo.append((path, "codex", r["id"]))
+        except sqlite3.Error:
+            pass
+        finally:
+            db.close()
+    for path, app, sid in todo:
+        seen.add(path)
+        try:
+            st = os.stat(path)
+            e = files.get(path)
+            if e and e["size"] == st.st_size and e["mtime"] == st.st_mtime:
+                continue
+            if not e or st.st_size < e["size"]:
+                e = files[path] = {"app": app, "id": sid, "offset": 0, "prompts": []}
+            (index_claude if app == "claude" else index_codex)(path, e)
+            e["size"], e["mtime"] = st.st_size, st.st_mtime
+            dirty = True
+        except OSError:  # gone while being read
+            continue
+    for path in [p for p in files if p not in seen]:
+        del files[path]
+        dirty = True
+    if dirty:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = PROMPT_INDEX + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(index, f)
+        os.replace(tmp, PROMPT_INDEX)
+    return index
+
+
+def deep_search(words):
+    """-> ({session id: [(unix time, prompt)]}, Claude transcript paths, Codex thread ids) for every
+    prompt here that has all of `words` (any case)."""
+    hits, paths, threads = {}, set(), set()
+    for path, e in prompt_index()["files"].items():
+        for t, txt in e["prompts"]:
+            low = txt.lower()
+            if all(w in low for w in words):
+                hits.setdefault(e["id"], []).append((t, txt))
+                (paths if e["app"] == "claude" else threads).add(path if e["app"] == "claude" else e["id"])
+    return hits, paths, threads
+
+
+def match_snippet(text, words):
+    low = text.lower()
+    at = min([i for i in (low.find(w) for w in words) if i >= 0] or [0])
+    start = max(0, at - 12)
+    return ("…" if start else "") + text[start:]
+
+
+def matched_rows(sessions, hits, words):
+    """The conversations (one row each, as in the list) that have a prompt matching, each with the
+    most recent matching prompt as `match`."""
+    out = []
+    for r in merge_rows(sessions):
+        ids = [m["id"] for m in r.get("chain") or []] or [r["id"]]
+        found = sorted(h for i in ids for h in hits.get(i, []))
+        if found:
+            t, text = found[-1]
+            out.append(dict(r, match=match_snippet(text, words), match_ts=iso(t), matches=len(found),
+                            active_win=(r.get("active") or 0) / 60))
+    return out
+
+
+def remote_search(hosts, query, timeout=180):
+    """[(label, rows, note)]: every host searches its own sessions."""
+    procs = {}
+    for label, dest in hosts.items():
+        argv = ["ssh", *SSH_OPTS, dest, f"{REMOTE_S} search --json --local -- {shlex.quote(query)}"]
+        try:
+            procs[label] = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True)
+        except OSError:
+            procs[label] = None
+    out = []
+    for label, p in procs.items():
+        if p is None:
+            out.append((label, [], "ssh failed"))
+            continue
+        try:
+            stdout, stderr = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out.append((label, [], "took too long to search"))
+            continue
+        try:
+            answer = json.loads(stdout)
+            if any(o.get("match") is None for o in answer):  # an older s there lists instead of searching
+                out.append((label, [], f"its s cannot search yet (run: s hosts setup {label})"))
+            else:
+                out.append((label, [from_json(o, label) for o in answer], None))
+        except ValueError:
+            err = (stderr.strip().splitlines() or ["no answer"])[-1]
+            out.append((label, [], f"could not search there ({err}; run: s hosts setup {label})"))
+    return out
+
+
+def highlight(text, words):
+    if not TTY or not words:
+        return text
+    return re.sub("|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)),
+                  lambda m: c("1;33", m.group(0)), text, flags=re.I)
+
+
 # ----------------------------------------------------------------- live state
 
 _RUNNING = None
@@ -1480,6 +1684,7 @@ STATUS_COLOR = {"live": "32", "waiting": "33", "done": "", "fired": "", "dead": 
 _JOB_INDEX = None
 _ALL_SESSIONS = []
 SESSION_INDEX = {}  # (host, id) -> session, every machine's
+SEARCH_WORDS = []  # what `s search` / `?text` looked for, to highlight
 
 
 def job_index():
@@ -2524,7 +2729,7 @@ def print_list(view, start=0, count=None):
     lw = max(16, cols - fixed - 1)
 
     def row(idx, flag, nm, proj, app, host, last, prompt, work, header=False):
-        cells = [(f"{idx:>3}", "1;36"), (flag, None), (f"{nm:<{nw}}", "1")]
+        cells = [(f"{idx:>3}", "1;36"), (f"{nm:<{nw}}", "1"), (flag, None)]
         if show_proj:
             cells.append((f"{proj:<{pw}}", "2"))
         if show_app:
@@ -2532,17 +2737,24 @@ def print_list(view, start=0, count=None):
         if hw:
             cells.append((f"{host:<{hw}}", "35"))
         cells.append((f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else ""))
-        cells.append((f"{prompt:<{lw}}" if show_work else prompt, ""))
+        if isinstance(prompt, tuple):  # a search hit: the matching prompt, its words highlighted
+            plain = prompt[0]
+            cells.append((highlight(plain, SEARCH_WORDS) + (" " * (lw - len(plain)) if show_work else ""), None))
+        else:
+            cells.append((f"{prompt:<{lw}}" if show_work else prompt, ""))
         if show_work:
             cells.append((f"{work:>5}", ""))
         if header:
             return c("2", gutter.join(t for t, _ in cells).rstrip())
         return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells).rstrip()
 
-    print(row("#", "  ", "name", "project", " app", "host", "last", "last prompt", " work", header=True))
+    found = any(s.get("match") is not None for s in rows)
+    print(row("#", "  ", "name", "project", " app", "host", "last", "matching prompt" if found else "last prompt",
+              " work", header=True))
     for i, s in enumerate(rows, start + 1):
+        prompt = (fit(s["match"], lw),) if s.get("match") is not None else fit(last_prompt(s), lw)
         print(row(i, flags(s), fit(name(s), nw), fit(short_project(s), pw), app_cell(s), s.get("host") or "",
-                  rel(s["last"]), fit(last_prompt(s), lw), hm(s["active_win"])))
+                  rel(s["last"]), prompt, hm(s["active_win"])))
 
 
 def live_block(s, indent="   "):
@@ -2595,6 +2807,12 @@ def live_block(s, indent="   "):
 
 TMUX_MODE = "auto"  # auto: remote sessions run inside tmux when it exists; always: local ones too; never
 DAYS = 14
+DAYS_STEPS = (14, 30, 90, 365, 36500)  # how far back `o` in the picker reaches, step by step
+
+
+def window_label(days):
+    return "all time" if days >= 36500 else "last year" if days == 365 else f"last {days} days"
+
 
 
 def local_argv(s, target, extra, prepared=None):
@@ -3012,30 +3230,32 @@ def run_codex(argv):
 
 # ----------------------------------------------------------------- pickers
 
-def pick_fzf(view, self_path):
-    """-> (session, target tool) or None."""
+def pick_fzf(view, self_path, older=None):
+    """-> (session, target tool), "older" (alt-o, when `older` names a longer window), or None."""
     lines = []
     apps = any(app_of(s) != "claude" or s.get("chain") for s in view)
     for s in view:
         r = running_of(s)
         mark = ("●" if r else " ") + ("↻" if s["jobs"] else " ")
         host = f"{(s.get('host') or ''):<8}" if HOSTS else ""
-        lines.append("\t".join([s["id"], mark, fit(name(s), 38).ljust(38), fit(short_project(s), 18).ljust(18),
+        lines.append("\t".join([s["id"], fit(name(s), 38).ljust(38), mark, fit(short_project(s), 18).ljust(18),
                                 *([f"{app_cell(s):<7}"] if apps else []), *([host] if host else []),
-                                f"{rel(s['last']):<7}", fit(last_prompt(s), 60).ljust(60),
+                                f"{rel(s['last']):<7}", fit(s.get("match") or last_prompt(s), 60).ljust(60),
                                 f"{hm(s['active_win']):>5}"]))
     try:
         res = subprocess.run(
             ["fzf", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tabstop=1",
-             "--expect=alt-c,alt-x",
-             "--header=enter = resume · alt-c / alt-x = continue in Claude / Codex · ctrl-c = quit"
-             " · ● running · ↻ cron jobs",
+             "--expect=alt-c,alt-x,alt-o",
+             "--header=enter = resume · alt-c / alt-x = continue in Claude / Codex"
+             + (f" · alt-o = older ({older})" if older else "") + " · ctrl-c = quit · ● running · ↻ cron jobs",
              "--preview", f"{sys.executable} {self_path} show {{1}}",
              "--preview-window=down,55%,wrap"],
             input="\n".join(lines), capture_output=True, text=True)
     except FileNotFoundError:
         return None
     out = res.stdout.split("\n", 1)
+    if out[0].strip() == "alt-o" and older:
+        return "older"
     if res.returncode != 0 or len(out) < 2 or not out[1].strip():
         return None
     sid = out[1].split("\t", 1)[0].strip()
@@ -3049,18 +3269,21 @@ def clear():
         sys.stdout.flush()
 
 
-def pick_builtin(view_all, query, notes):
-    """-> (session, target tool) or None."""
-    flt, page = query, 0
+def pick_builtin(view_all, query, notes, window="", older=None, deep=None, searched=None):
+    """-> (session, target tool) or None. older() -> (a longer list, its window) or None at the
+    end; deep(text) -> (the conversations with a prompt matching, notes)."""
+    flt, page, before = query, 0, None
     while True:
         view = [s for s in view_all if matches(s, flt)] if flt else view_all
         _, lines = term()
-        per = max(5, lines - 6 - len(notes))
+        per = max(5, lines - 7 - len(notes))
         pages = max(1, math.ceil(len(view) / per))
         page = min(max(page, 0), pages - 1)
         clear()
         for n in notes:
             print(c("33", n))
+        if searched:
+            print(c("2", f"prompts with: {searched}" + ("   (? goes back to the list)" if before is not None else "")))
         if flt:
             print(c("2", f"filter: {flt}   (/ clears)"))
         if view:
@@ -3068,11 +3291,13 @@ def pick_builtin(view_all, query, notes):
         else:
             print(c("33", "no sessions match"))
         print()
-        status = f"{len(view)} sessions"
+        status = f"{len(view)} " + ("conversations" if searched else "sessions") + (
+            "" if searched or not window else f", {window}")
         if pages > 1:
             status += f" · page {page + 1}/{pages} · n / p to page"
         print(c("2", f"{status} · number = resume · c # / x # = continue in Claude / Codex · s # = details"
-                     f" · /text = filter · q = quit · ● running · ↻ cron"))
+                     f" · /text = filter · ?text = search every prompt" + (" · o = older" if older and not searched else "")
+                     + " · q = quit · ● running · ↻ cron"))
         try:
             ans = input(c("1", "> ")).strip()
         except (EOFError, KeyboardInterrupt):
@@ -3082,11 +3307,29 @@ def pick_builtin(view_all, query, notes):
             return None
         if ans == "":
             continue
+        if ans in ("o", "older") or (ans in ("n", "next") and page + 1 >= pages):
+            more = older() if older and not searched else None
+            if more:  # the next page is where the older sessions start
+                view_all, window = more
+                page += ans in ("n", "next")
+            continue
         if ans in ("n", "next"):
             page += 1
             continue
         if ans in ("p", "prev", "b", "back"):
             page -= 1
+            continue
+        if ans.startswith("?"):
+            text = ans[1:].strip()
+            if not text:
+                if before is not None:
+                    view_all, searched, before, flt, page = before, None, None, "", 0
+                continue
+            if deep:
+                print(c("2", f"searching every prompt for {text} ..."))
+                rows, notes = deep(text)
+                before = view_all if before is None else before
+                view_all, searched, flt, page = rows, text, "", 0
             continue
         if ans.startswith("/"):
             flt, page = ans[1:].strip(), 0
@@ -3179,7 +3422,7 @@ def to_json(s):
     keys = ("id", "app", "cwd", "project_dir", "host", "branch", "custom_title", "ai_title", "first", "last",
             "active", "active_win", "days", "user", "assistant", "tools", "model", "ctx_tokens", "todo",
             "last_said", "last_prompt_ts", "first_prompts", "last_prompts", "group", "chain", "broken",
-            "usage")
+            "usage", "match", "match_ts", "matches")
     return {"name": name(s), "last_prompt": last_prompt(s), "running": running_of(s), "doing": doing(s),
             "daemon": daemon_of(s),
             "jobs": [dict({k: v for k, v in j.items() if k != "sessions"}, status=st, fires_text=text,
@@ -3227,7 +3470,7 @@ def main():
     ap.add_argument("--no-fzf", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     ap.add_argument("-v", "--version", action="store_true")
-    a = ap.parse_args(argv)
+    a = ap.parse_intermixed_args(argv)  # options may come between the words
     if a.help:
         print(__doc__.strip())
         return
@@ -3275,25 +3518,73 @@ def main():
             HOSTS = {k: v for k, v in HOSTS.items() if k in named}
     # `s show <id>` (the fzf preview runs it per line) needs no other machine if the id is here
     lookup = rest[1] if rest[:1] in (["show"], ["path"]) and len(rest) == 2 and not rest[1].isdigit() else None
-    pending = start_remote(HOSTS, a.days) if HOSTS and not lookup else None
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        codex_job = None if a.no_codex else ex.submit(load_codex, a.days, a.rescan)
-        local = load_sessions(a.days, a.rescan)
-        codex, codex_note = codex_job.result() if codex_job else ([], None)
-    _ALL_SESSIONS = local
-    sessions = local + codex
-    link_sessions(sessions)  # other machines link their own before answering
-    notes = [codex_note] if codex_note else []
-    if lookup and HOSTS and len([s for s in sessions if s["id"].startswith(lookup)]) != 1:
-        pending = start_remote(HOSTS, a.days)
-    elif lookup and HOSTS:  # found here; the other machines' last answers can still hold a newer copy
-        sessions += cached_remote(HOSTS, a.days)
-    if pending:
-        for label, remote, note in finish_remote(pending):
-            sessions += remote
+
+    def gather(days, include=(), threads=(), remote=True):
+        """Every session in the window (and the Claude transcripts / Codex threads named), here and
+        on the other machines, linked into conversations. -> (sessions, notes)"""
+        global _ALL_SESSIONS, SESSION_INDEX
+        pending = start_remote(HOSTS, days) if HOSTS and remote and not lookup else None
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            codex_job = None if a.no_codex else ex.submit(load_codex, days, a.rescan, threads)
+            local = load_sessions(days, a.rescan, include)
+            codex, codex_note = codex_job.result() if codex_job else ([], None)
+        _ALL_SESSIONS = local
+        found = local + codex
+        link_sessions(found)  # other machines link their own before answering
+        found_notes = [codex_note] if codex_note else []
+        if lookup and HOSTS and len([s for s in found if s["id"].startswith(lookup)]) != 1:
+            pending = start_remote(HOSTS, days)
+        elif lookup and HOSTS:  # found here; the other machines' last answers can still hold a newer copy
+            found += cached_remote(HOSTS, days)
+        if pending:
+            for label, remote_sessions, note in finish_remote(pending):
+                found += remote_sessions
+                if note:
+                    found_notes.append(f"{label}: {note}")
+        SESSION_INDEX = {(s.get("host"), s["id"]): s for s in found}
+        return found, found_notes
+
+    def search(text):
+        """(the conversations, here and on the other machines, with a prompt that has every word
+        of text, newest match first; notes)"""
+        global SEARCH_WORDS
+        SEARCH_WORDS = text.lower().split()
+        hits, paths, threads = deep_search(SEARCH_WORDS)
+        found, found_notes = gather(a.days, paths, threads, remote=False)
+        rows = matched_rows(found, hits, SEARCH_WORDS)
+        for label, remote_rows, note in (remote_search(HOSTS, text) if HOSTS else []):
+            rows += remote_rows
+            SESSION_INDEX.update({(r["host"], r["id"]): r for r in remote_rows})
             if note:
-                notes.append(f"{label}: {note}")
-    SESSION_INDEX = {(s.get("host"), s["id"]): s for s in sessions}
+                found_notes.append(f"{label}: {note}")
+        rows.sort(key=lambda r: r.get("match_ts") or "", reverse=True)
+        return rows, found_notes
+
+    if rest[:1] == ["search"]:
+        text = " ".join(rest[1:] + extra).strip()  # words after -- too, so they can start with -
+        if not text:
+            sys.exit("usage: s search WORDS   (finds every prompt you wrote with all of them, in any session)")
+        rows, notes = search(text)
+        if a.json:
+            print(json.dumps([to_json(s) for s in rows], indent=1))
+            return
+        for n in notes:
+            print(c("33", n), file=sys.stderr)
+        if not rows:
+            sys.exit(f"no prompt has all of: {text}")
+        if a.print or not sys.stdin.isatty():
+            print_mode(rows)
+            return
+        if not a.no_fzf and shutil.which("fzf"):
+            chosen = pick_fzf(rows, os.path.abspath(__file__))
+        else:
+            chosen = pick_builtin(rows, "", notes, "", None, search, text)
+        if chosen:
+            resume(chosen[0], extra, a.dry_run, chosen[1] or target)
+        return
+
+    sessions, notes = gather(a.days)
+    a.rescan = False  # once is enough when the picker reaches further back
     if notes and not a.json:
         for n in notes:
             print(c("33", n), file=sys.stderr)
@@ -3359,10 +3650,30 @@ def main():
         print_mode(hits)  # no terminal to pick from: behave like -p
         return
 
+    window = {"days": a.days}
+
+    def older():
+        """The list reaching further back -> (rows, its window), or None when it covers everything."""
+        global DAYS
+        days = next((d for d in DAYS_STEPS if d > window["days"]), None)
+        if days is None:
+            return None
+        print(c("2", f"loading the sessions of the {window_label(days)[5:] if days < 36500 else 'whole history'} ..."))
+        found, _ = gather(days)
+        window["days"] = DAYS = days
+        return select(merge_rows(found), days, a.min, a.sort), window_label(days)
+
     if not a.no_fzf and shutil.which("fzf"):
-        chosen = pick_fzf(hits, os.path.abspath(__file__))
+        while True:
+            further = next((d for d in DAYS_STEPS if d > window["days"]), None)
+            chosen = pick_fzf(hits, os.path.abspath(__file__), window_label(further) if further else None)
+            if chosen != "older":
+                break
+            rows, _ = older()
+            hits = [s for s in rows if matches(s, query)] if query else rows
     else:
-        chosen = pick_builtin(hits, query if len(hits) != len(view) else "", notes)
+        chosen = pick_builtin(hits, query if len(hits) != len(view) else "", notes, window_label(a.days),
+                              older, search)
     if chosen:
         s, picked = chosen
         resume(s, extra, a.dry_run, picked or target)
