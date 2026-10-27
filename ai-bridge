@@ -58,7 +58,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/ai-bridge"
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -406,7 +406,8 @@ def cmd_claude_transcript(args):
 # ---------------------------------------------------------------- codex app-server
 
 class AppServer:
-    """Minimal JSON-RPC client for `codex app-server` over stdio."""
+    """Minimal JSON-RPC client for `codex app-server` over stdio. Only to-codex needs it (Codex's
+    importer); reading Codex sessions goes to Codex's files."""
 
     def __init__(self, cwd, timeout=60):
         try:
@@ -428,6 +429,12 @@ class AppServer:
         return self
 
     def __exit__(self, *exc):
+        try:  # end of input lets it finish what it is writing (such as a refreshed login) and exit
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         self.proc.terminate()
         try:
             self.proc.wait(timeout=5)
@@ -487,95 +494,159 @@ class AppServer:
 
 
 # ---------------------------------------------------------------- Codex sessions
+#
+# Read straight from Codex's files: its thread index (state_<n>.sqlite, opened read-only) and
+# each thread's session file. Starting `codex app-server` just to look would be one more
+# process sharing, and possibly refreshing, the ChatGPT login; two refreshing at once can sign
+# every Codex out ("unauthorized (401)").
+
+def codex_db():
+    import sqlite3
+    from urllib.parse import quote
+    found = []
+    for p in CODEX_HOME.glob("state_*.sqlite"):
+        m = re.search(r"state_(\d+)\.sqlite$", p.name)
+        if m:
+            found.append((int(m.group(1)), p))
+    if not found:
+        raise BridgeError("no Codex sessions here (%s)" % CODEX_HOME)
+    db = sqlite3.connect("file:%s?mode=ro" % quote(str(max(found)[1])), uri=True, timeout=3)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def find_codex_thread(cwd, thread_id=None):
+    """This folder's latest Codex session (or the one asked for) as a dict, or None."""
+    db = codex_db()
+    try:
+        if thread_id:
+            row = db.execute("select * from threads where id = ? or name = ? order by updated_at desc",
+                             (thread_id, thread_id)).fetchone()
+            return dict(row) if row else None
+        for folder in dict.fromkeys([str(cwd), str(project_root(cwd))]):
+            row = db.execute("select * from threads where cwd = ? and archived = 0 and source not like '{%' "
+                             "and source != 'exec' order by updated_at desc limit 1", (folder,)).fetchone()
+            if row:
+                return dict(row)
+        return None
+    finally:
+        db.close()
+
+
+def read_rollout(path):
+    """A Codex session file's text; Codex compresses older ones with zstd."""
+    for p in (Path(path), Path(str(path) + ".zst")) if path else ():
+        if not p.is_file():
+            continue
+        data = p.read_bytes()
+        if p.suffix == ".zst":
+            try:
+                from compression import zstd  # Python 3.14+
+                data = zstd.decompress(data)
+            except ImportError:
+                if not shutil.which("zstd"):
+                    raise BridgeError("%s is compressed and zstd is not installed" % p)
+                data = subprocess.run(["zstd", "-dcq"], input=data, capture_output=True).stdout
+        return data.decode("utf-8", "ignore")
+    raise BridgeError("Codex's session file is gone: %s" % path)
+
+
+def content_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(c.get("text") or "" for c in content or [] if isinstance(c, dict) and "text" in c)
+
 
 def item_lines(item):
     kind = item.get("type")
-    if kind == "userMessage":
-        text = "\n".join(c.get("text", "") for c in item.get("content") or []
-                         if c.get("type") == "text").strip()
+    if kind in ("UserMessage", "user_message"):
+        text = (content_text(item.get("content")) or item.get("message") or "").strip()
         return ["**You:** " + text] if text else []
-    if kind == "agentMessage" and item.get("text"):
-        return ["**Codex:** " + item["text"].strip()]
-    if kind == "plan" and item.get("text"):
-        return ["**Plan:**\n" + item["text"].strip()]
-    if kind == "commandExecution":
-        actions = item.get("commandActions") or []
-        cmd = (actions[0].get("command") if actions else None) or item.get("command") or ""
-        code = item.get("exitCode")
+    if kind in ("AgentMessage", "agent_message"):
+        text = (content_text(item.get("content")) or item.get("message") or "").strip()
+        return ["**Codex:** " + text] if text else []
+    if kind == "CommandExecution":
+        cmd = item.get("command") or ""
+        if isinstance(cmd, list):  # ["/bin/zsh", "-lc", "the command"]
+            cmd = cmd[-1] if len(cmd) == 3 and cmd[1] in ("-c", "-lc") else " ".join(map(str, cmd))
+        code = item.get("exit_code")
         tail = " (exit %s)" % code if code not in (0, None) else ""
-        return ["- ran `%s`%s" % (" ".join(cmd.split())[:300], tail)]
-    if kind == "fileChange":
-        paths = [c.get("path") for c in item.get("changes") or [] if c.get("path")]
+        return ["- ran `%s`%s" % (" ".join(str(cmd).split())[:300], tail)]
+    if kind == "FileChange":
+        changes = item.get("changes") or {}
+        paths = list(changes) if isinstance(changes, dict) else [
+            c.get("path") for c in changes if isinstance(c, dict) and c.get("path")]
         return ["- changed " + ", ".join(paths)] if paths else []
-    if kind == "mcpToolCall":
+    if kind == "McpToolCall":
         return ["- used %s.%s" % (item.get("server"), item.get("tool"))]
-    if kind == "webSearch" and item.get("query"):
+    if kind in ("WebSearch", "Extension") and item.get("query"):
         return ["- searched the web: " + item["query"]]
-    if kind == "contextCompaction":
+    if kind == "ContextCompaction":
         return ["- (context was compacted here)"]
-    return []  # hookPrompt (our memory block), reasoning, tool plumbing
+    return []  # reasoning, subagent plumbing, tool output
 
 
-def render_turns(srv, thread_id):
-    blocks, size, cursor, more = [], 0, None, False
-    while True:
-        params = {"threadId": thread_id, "limit": 25, "itemsView": "full",
-                  "sortDirection": "desc"}
-        if cursor:
-            params["cursor"] = cursor
-        page = srv.request("thread/turns/list", params)
-        for turn in page.get("data") or []:
-            lines = [l for item in turn.get("items") or [] for l in item_lines(item)]
-            if not lines:
-                continue
-            block = "\n\n".join(lines)
-            if size + len(block) > HANDOFF_MAX_CHARS and blocks:
-                more = True
-                break
-            blocks.append(block)
-            size += len(block)
-        cursor = page.get("nextCursor")
-        if more or not cursor:
-            more = more or bool(cursor)
+def render_turns(path):
+    """The thread's turns as markdown blocks, most recent ones up to HANDOFF_MAX_CHARS. Turns
+    Codex imported from a Claude transcript are left out: Claude has them already."""
+    text = read_rollout(path)
+    items = '"item_completed"' in text  # newer files log every item; older ones only messages
+    turns, imported = [], False
+    for line in text.splitlines():
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        p = o.get("payload")
+        if o.get("type") != "event_msg" or not isinstance(p, dict):
+            continue
+        if p.get("type") == "task_started":
+            imported = str(p.get("turn_id") or "").startswith("external-import")
+            turns.append([])
+            continue
+        if imported:
+            continue
+        if p.get("type") == "item_completed":
+            lines = item_lines(p.get("item") or {})
+        elif not items and p.get("type") in ("user_message", "agent_message"):
+            lines = item_lines(p)
+        else:
+            continue
+        if not turns:
+            turns.append([])
+        turns[-1] += lines
+    blocks, size = [], 0
+    texts = ["\n\n".join(t) for t in turns if t]
+    for block in reversed(texts):
+        if blocks and size + len(block) > HANDOFF_MAX_CHARS:
             break
+        blocks.append(block)
+        size += len(block)
     blocks.reverse()
-    return blocks, more
-
-
-def find_codex_thread(srv, cwd, thread_id=None):
-    if thread_id:
-        return srv.request("thread/read", {"threadId": thread_id}).get("thread")
-    for folder in dict.fromkeys([str(cwd), str(project_root(cwd))]):
-        found = srv.request("thread/list", {
-            "limit": 1, "cwd": [folder], "sortKey": "updated_at",
-            "sortDirection": "desc"}, timeout=10).get("data") or []
-        if found:
-            return found[0]
-    return None
+    return blocks, len(blocks) < len(texts)
 
 
 def thread_title(thread):
     if thread.get("name"):
         return thread["name"]
-    lines = (thread.get("preview") or "").strip().splitlines()
+    lines = (thread.get("title") or thread.get("first_user_message") or "").strip().splitlines()
     return lines[0][:80] if lines else "untitled"
 
 
 def codex_transcript(cwd, thread_id=None):
     """(markdown, thread, folder) for this folder's latest Codex session."""
-    with AppServer(cwd) as srv:
-        thread = find_codex_thread(srv, cwd, thread_id)
-        if not thread:
-            raise BridgeError("no Codex session found for %s" % cwd)
-        blocks, more = render_turns(srv, thread["id"])
+    thread = find_codex_thread(cwd, thread_id)
+    if not thread:
+        raise BridgeError("no Codex session found for %s" % (thread_id or cwd))
+    blocks, more = render_turns(thread.get("rollout_path"))
     work = Path(thread.get("cwd") or cwd)
     if not work.is_dir():
         work = cwd
-    when = datetime.datetime.fromtimestamp(thread.get("updatedAt") or time.time())
+    when = datetime.datetime.fromtimestamp(thread.get("updated_at") or time.time())
     header = ["# Codex session", "",
               "- Session: %s (`%s`)" % (thread_title(thread), thread["id"]),
               "- Folder: %s" % work,
-              "- Model: %s %s" % (thread.get("model") or "?", thread.get("reasoningEffort") or ""),
+              "- Model: %s %s" % (thread.get("model") or "?", thread.get("reasoning_effort") or ""),
               "- Last active: %s" % when.strftime("%Y-%m-%d %H:%M")]
     if more:
         header.append("- Earlier turns are left out; the full session: `codex resume %s`"
@@ -896,17 +967,16 @@ def cmd_claude_hook():
     except Exception as exc:
         sys.stderr.write("ai-bridge mcp sync: %s\n" % exc)
     try:
-        with AppServer(cwd, timeout=5) as srv:
-            thread = find_codex_thread(srv, cwd)
-        if thread and time.time() - (thread.get("updatedAt") or 0) < RECENT_DAYS * 86400:
+        thread = find_codex_thread(cwd)
+        if thread and time.time() - (thread.get("updated_at") or 0) < RECENT_DAYS * 86400:
             parts.append("The user also works with Codex (GPT) in this folder. Their latest "
                          "Codex session: \"%s\", last active %s. If the user wants to "
                          "continue it, or asks what Codex did, read it with: %s "
                          "codex-transcript %s"
-                         % (thread_title(thread), ago(thread["updatedAt"]), SCRIPT,
+                         % (thread_title(thread), ago(thread["updated_at"]), SCRIPT,
                             thread["id"]))
     except Exception:
-        pass  # Codex missing or slow: nothing to report
+        pass  # no Codex here, or its index is busy: nothing to report
     if parts:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                                  "additionalContext": "\n\n".join(parts)}}))
@@ -995,6 +1065,8 @@ def cmd_to_codex(args):
                   "what is still open. Don't start new work until I say so." % out)
         return launch(["codex", "-p", ASTRA_PROFILE, prompt], work, show)
     print("Importing Claude session %s (~%dk tokens) into Codex..." % (source.stem, tokens // 1000))
+    auth = CODEX_HOME / "auth.json"
+    login = auth.stat().st_mtime if auth.exists() else None
     with AppServer(work) as srv:
         srv.request("externalAgentConfig/import", {"migrationItems": [{
             "itemType": "SESSIONS",
@@ -1007,6 +1079,8 @@ def cmd_to_codex(args):
     for result in done.get("itemTypeResults") or []:
         for failure in result.get("failures") or []:
             raise BridgeError("Codex could not import the session: %s" % failure.get("message"))
+    if (auth.stat().st_mtime if auth.exists() else None) != login:
+        time.sleep(3)  # the importer refreshed the ChatGPT login; starting Codex at once can be refused
     thread = imported_thread(source)
     if not thread:
         raise BridgeError("Codex found nothing to import in %s (a session with no "
@@ -1020,7 +1094,7 @@ def cmd_to_claude(args):
     rest = [a for a in args if a not in ("--print", "--no-pull")]
     cwd = Path.cwd().resolve()
     text, thread, work = codex_transcript(cwd, rest[0] if rest else None)
-    when = datetime.datetime.fromtimestamp(thread.get("updatedAt") or time.time())
+    when = datetime.datetime.fromtimestamp(thread.get("updated_at") or time.time())
     HANDOFFS.mkdir(parents=True, exist_ok=True)
     out = HANDOFFS / ("%s-%s.md" % (when.strftime("%Y%m%d-%H%M"), thread["id"]))
     out.write_text(text)
@@ -1034,7 +1108,8 @@ def cmd_to_claude(args):
               "transcript is at %s. Read it, then tell me in a few lines where that "
               "session left off and what is still open. Don't start new work until I "
               "say so." % out)
-    return launch(["claude", "--add-dir", str(HANDOFFS), prompt], work, show)
+    # --add-dir=DIR: as `--add-dir DIR` it would take the prompt for one more folder
+    return launch(["claude", "--add-dir=" + str(HANDOFFS), prompt], work, show)
 
 
 def launch(cmd, cwd, show):
@@ -1098,13 +1173,29 @@ def cmd_mem(args):
 ZSH_WRAPPER = r'''# >>> ai-bridge >>>
 # `codex` starts the bridge's profile (~/.codex/astra.config.toml) and first copies
 # Claude's MCP servers into Codex. Pass -p/--profile or -m/--model to choose
-# something else. Remove this block to undo.
+# something else. If Codex can't start because the ChatGPT login was refused
+# (401), it tries once more. Remove this block to undo.
 export SESSIONS_CODEX_ARGS="-p astra"  # s (sessions picker) starts Codex with Astra too
+_ai_bridge_codex() {
+  local err rc
+  err=$(mktemp -t ai-bridge-codex 2>/dev/null) || { command codex "$@"; return; }
+  command codex "$@" 2> >(tee "$err" >&2)
+  rc=$?
+  if [ $rc -ne 0 ] && { sleep 0.3; grep -q "unauthorized (401)" "$err"; }; then
+    echo "ai-bridge: Codex's ChatGPT login was refused; trying again in a moment..." >&2
+    sleep 3
+    command codex "$@"
+    rc=$?
+    [ $rc -ne 0 ] && echo "ai-bridge: if it still says 401, sign in again: codex login (same ChatGPT account as the ChatGPT app; they share one login)" >&2
+  fi
+  rm -f "$err"
+  return $rc
+}
 codex() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      -p|--profile|--profile=*|-m|--model|--model=*) command codex "$@"; return ;;
+      -p|--profile|--profile=*|-m|--model|--model=*) _ai_bridge_codex "$@"; return ;;
     esac
   done
   case "${1:-}" in
@@ -1114,7 +1205,7 @@ features|help|-h|--help|-V|--version)
       command codex "$@" ;;
     *)
       command -v ai-bridge >/dev/null && ai-bridge sync --quiet 2>/dev/null
-      command codex -p astra "$@" ;;
+      _ai_bridge_codex -p astra "$@" ;;
   esac
 }
 # <<< ai-bridge <<<

@@ -14,7 +14,9 @@ Usage
   s 3                    resume the 3rd session in that list, in its own tool
   s 3 --codex            continue it in Codex instead (--claude: in Claude Code).
                          Claude -> Codex imports the full conversation as a Codex
-                         thread; Codex -> Claude hands Claude its transcript.
+                         thread; Codex -> Claude hands Claude its transcript. If
+                         the conversation has a session in that tool already, it
+                         resumes that one, with a transcript of what happened since.
                          A conversation continued that way stays one row (⇄);
                          its number opens wherever you worked on it last.
   s <session id>         open exactly that session, even inside such a chain
@@ -51,7 +53,9 @@ Memories and configs between machines
   s sync studio                  two-way sync of Claude's memory folders and
                                  your configs (settings.json, CLAUDE.md,
                                  keybindings, commands, agents, hooks, skills,
-                                 MCP servers). Newest copy wins per file;
+                                 MCP servers; Codex's AGENTS.md, hooks, rules
+                                 and your settings in its config.toml and
+                                 profiles). Newest copy wins per file;
                                  settings and memory indexes are merged;
                                  a file deleted on one side since the last
                                  sync is deleted on the other. Shows the plan
@@ -72,8 +76,8 @@ Options
   --host LABEL=DEST      query this host too (or only, with --local)
   --tmux | --no-tmux     run local sessions inside tmux too | never use tmux
   --claude | --codex     continue the chosen session in that tool
-  --no-codex             leave Codex sessions out (they are listed when the
-                         codex CLI is installed)
+  --no-codex             leave Codex sessions out (they are listed when
+                         ~/.codex has any)
   --json                 machine-readable output
   -n, --dry-run          print the resume command instead of running it
   --rescan               rebuild the cache from scratch
@@ -105,13 +109,15 @@ import re
 import select as selectlib
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
+from urllib.parse import quote
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -124,7 +130,7 @@ PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CONFIG_DIR = env("CONFIG_DIR") or os.path.expanduser("~/.config/sessions")
 CACHE_DIR = env("CACHE_DIR") or os.path.expanduser("~/.cache/sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 HOSTS_FILE = os.path.join(CONFIG_DIR, "hosts")
 HOME = env("HOME") or os.path.expanduser("~")  # override for tests
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
@@ -132,9 +138,7 @@ GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
-CODEX_CACHE_VERSION = 4
-# files Codex rewrites whenever a thread changes; while they look the same, the cached list is current
-CODEX_STAMP_FILES = ("session_index.jsonl", "state_*.sqlite", "thread_history_*.sqlite")
+CODEX_CACHE_VERSION = 5
 HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # transcripts handed from one tool to the other
 HANDOFF_MAX = 60_000
 # Codex models read about 272k tokens. A Claude conversation bigger than this is not imported
@@ -157,8 +161,9 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # How one tool's session points at the other's: a Codex transcript handed to Claude (by s or by
 # ai-bridge), or a command that reads the other tool's session ("continue where Codex left off").
 HANDOFF_RE = re.compile(r"handoffs/(?:\d{8}-\d{4}-)?(" + UUID + r")\.md")
-READS_CODEX_RE = re.compile(r"codex-transcript\s+(" + UUID + ")")
-READS_CLAUDE_RE = re.compile(r"claude-transcript\s+(" + UUID + ")")
+# (ai-bridge's reader itself, not any command that mentions it)
+READS_CODEX_RE = re.compile(r"ai-bridge['\"]?\s+codex-transcript\s+(" + UUID + ")")
+READS_CLAUDE_RE = re.compile(r"ai-bridge['\"]?\s+claude-transcript\s+(" + UUID + ")")
 PASTE_RE = re.compile(r"</?pasted_content[^>]*>")
 REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 WS_RE = re.compile(r"\s+")
@@ -276,6 +281,7 @@ LONG_PRICES = {
 }
 FAST_PRICES = {"claude-opus-5-5": (8, 40, 10, 16, 0.40), "claude-opus-5": (10, 50, 12.50, 20, 1.00),
                "claude-opus-4-8": (10, 50, 12.50, 20, 1.00)}
+UNPRICED = {"codex-auto-review": "Codex's approval reviewer"}  # models with no API list price
 US_ONLY = 1.1  # inference_geo "us" on Claude 4.6 and later
 WEB_SEARCH = 0.01  # $ per Claude web search
 NO_US_PREMIUM = ("claude-opus-4-5", "claude-opus-4-1", "claude-opus-4", "claude-sonnet-4-5",
@@ -572,18 +578,23 @@ def load_sessions(days, rescan=False):
     def read_subagent(path, parent):
         """A subagent's or workflow agent's transcript: its tokens count toward the session that ran it."""
         nonlocal dirty
-        s = os.stat(path)
         entry = cache.get(path)
-        if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
+        try:  # a running session may remove a subagent's file while s looks
+            s = os.stat(path)
+            if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
+                st = entry["st"]
+            elif s.st_mtime < horizon and not entry:
+                return
+            else:
+                st = (entry["st"] if entry and entry["size"] <= s.st_size
+                      else {"offset": 0, "usage": {}, "usage_recent": {}, "parent": parent or first_session_id(path)})
+                st = parse_usage(path, st)
+                cache[path] = {"mtime": s.st_mtime, "size": s.st_size, "st": st}
+                dirty = True
+        except OSError:
+            if not entry:
+                return
             st = entry["st"]
-        elif s.st_mtime < horizon and not entry:
-            return
-        else:
-            st = (entry["st"] if entry and entry["size"] <= s.st_size
-                  else {"offset": 0, "usage": {}, "usage_recent": {}, "parent": parent or first_session_id(path)})
-            st = parse_usage(path, st)
-            cache[path] = {"mtime": s.st_mtime, "size": s.st_size, "st": st}
-            dirty = True
         if st.get("parent") and st["usage"]:
             sub_usage[st["parent"]] = merge_usage(sub_usage.get(st["parent"]), st["usage"])
 
@@ -592,7 +603,7 @@ def load_sessions(days, rescan=False):
             continue
         for ent in os.scandir(proj.path):
             if ent.is_dir() and re.fullmatch(UUID, ent.name):  # <session id>/subagents/...
-                for root, _, files in os.walk(ent.path):
+                for root, _, files in os.walk(ent.path):  # (os.walk skips folders that vanish)
                     for fn in files:
                         if fn.endswith(".jsonl"):
                             read_subagent(os.path.join(root, fn), ent.name)
@@ -602,17 +613,20 @@ def load_sessions(days, rescan=False):
                 continue
             if not ent.name.endswith(".jsonl"):
                 continue
-            s = ent.stat()
             entry = cache.get(ent.path)
-            if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
-                st = entry["st"]
-            elif s.st_mtime < horizon and not entry:
-                continue  # too old to matter and never parsed
-            else:
-                st = entry["st"] if entry and entry["size"] <= s.st_size else new_state()
-                st = parse(ent.path, st)
-                cache[ent.path] = {"mtime": s.st_mtime, "size": s.st_size, "st": st}
-                dirty = True
+            try:
+                s = ent.stat()
+                if entry and entry["mtime"] == s.st_mtime and entry["size"] == s.st_size:
+                    st = entry["st"]
+                elif s.st_mtime < horizon and not entry:
+                    continue  # too old to matter and never parsed
+                else:
+                    st = entry["st"] if entry and entry["size"] <= s.st_size else new_state()
+                    st = parse(ent.path, st)
+                    cache[ent.path] = {"mtime": s.st_mtime, "size": s.st_size, "st": st}
+                    dirty = True
+            except OSError:  # removed while s looked
+                continue
             if not st["first"]:
                 continue
             out.append(dict(id=ent.name[:-6], path=ent.path, project_dir=proj.name, host=None, app="claude", **st))
@@ -635,7 +649,8 @@ class CodexError(Exception):
 
 
 class CodexServer:
-    """Minimal JSON-RPC client for `codex app-server`, Codex's own API to its sessions."""
+    """Minimal JSON-RPC client for `codex app-server`, Codex's own API to its sessions. Only
+    importing a Claude conversation needs it; listing and reading go to Codex's files."""
 
     def __init__(self, cwd, timeout=8):
         try:
@@ -659,6 +674,12 @@ class CodexServer:
         self.close()
 
     def close(self):
+        try:  # end of input lets it finish what it is writing (such as a refreshed login) and exit
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         self.proc.terminate()
         try:
             self.proc.wait(timeout=3)
@@ -716,141 +737,211 @@ def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
 
-def codex_stamp():
-    """What Codex's files look like now. A database's write-ahead log counts by size: merely
-    opening the database (as `codex app-server` does when s asks it) touches its time."""
-    stamp = []
-    for pat in CODEX_STAMP_FILES:
-        for p in sorted(glob.glob(os.path.join(CODEX_HOME, pat))):
-            for path, field in ((p, "st_mtime"), (p + "-wal", "st_size")):
-                try:
-                    stamp.append(f"{os.path.basename(path)}:{getattr(os.stat(path), field)}")
-                except OSError:
-                    pass
-    return stamp
+def codex_db():
+    """Codex's own index of its threads, opened read-only, or None. s reads Codex's files and
+    never starts Codex just to look: every `codex` process shares the ChatGPT login and may
+    refresh it, and two refreshing at once can sign all of them out."""
+    found = []
+    for p in glob.glob(os.path.join(CODEX_HOME, "state_*.sqlite")):
+        m = re.search(r"state_(\d+)\.sqlite$", p)
+        if m:
+            found.append((int(m.group(1)), p))
+    if not found:
+        return None
+    db = sqlite3.connect(f"file:{quote(max(found)[1])}?mode=ro", uri=True, timeout=3)
+    db.row_factory = sqlite3.Row
+    return db
 
 
-def item_text(item):
-    return "\n".join(x.get("text", "") for x in item.get("content") or [] if x.get("type") == "text")
-
-
-def read_rollout(path):
-    """A Codex session file's text; Codex compresses older ones with zstd."""
+def rollout_file(path):
+    """Where a Codex session file is now; Codex compresses older ones with zstd."""
     for p in (path, path + ".zst") if path else ():
-        if not os.path.isfile(p):
-            continue
-        with open(p, "rb") as f:
-            data = f.read()
-        if p.endswith(".zst"):
-            try:
-                from compression import zstd  # Python 3.14+
-                data = zstd.decompress(data)
-            except ImportError:
-                if not shutil.which("zstd"):
-                    return None
-                data = subprocess.run(["zstd", "-dcq"], input=data, capture_output=True).stdout
-        return data.decode("utf-8", "ignore")
+        if os.path.isfile(p):
+            return p
     return None
 
 
-def codex_usage(path, model=None):
-    """Tokens per day and model from a Codex session file's running totals (token_count events)."""
-    usage, prev = {}, None
-    text = read_rollout(path)
-    for line in (text or "").splitlines():
-        if '"turn_context"' not in line and '"token_count"' not in line:
-            continue
+def read_rollout(path):
+    """A Codex session file's text."""
+    p = rollout_file(path)
+    if not p:
+        return None
+    with open(p, "rb") as f:
+        data = f.read()
+    if p.endswith(".zst"):
+        try:
+            from compression import zstd  # Python 3.14+
+            data = zstd.decompress(data)
+        except ImportError:
+            if not shutil.which("zstd"):
+                return None
+            data = subprocess.run(["zstd", "-dcq"], input=data, capture_output=True).stdout
+    return data.decode("utf-8", "ignore")
+
+
+CODEX_NOT_TOOLS = ("UserMessage", "AgentMessage", "Reasoning", "ContextCompaction", "SubAgentActivity",
+                   "Plan", "TodoList")
+CODEX_CALLS = ("function_call", "custom_tool_call", "local_shell_call", "web_search_call")
+
+
+def codex_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(x.get("text") or "" for x in content or [] if isinstance(x, dict) and "text" in x)
+
+
+def codex_command(item):
+    cmd = item.get("command")
+    if isinstance(cmd, list):  # ["/bin/zsh", "-lc", "the command"]
+        cmd = cmd[-1] if len(cmd) == 3 and cmd[1] in ("-c", "-lc") else shlex.join(map(str, cmd))
+    return str(cmd or "")
+
+
+def codex_events(text):
+    """A Codex session file as (kind, unix time, value), alike for its older and newer formats:
+    start (a turn begins), end (value: start, end, error), model, tokens (token_count info),
+    user / agent (message text), tool (the item), call (a raw tool call, for its text). Turns
+    Codex imported from a Claude transcript are left out: they are that Claude session's."""
+    items = '"item_completed"' in text  # newer files log every item; older ones only messages
+    imported = False
+    for line in text.splitlines():
         try:
             o = json.loads(line)
         except ValueError:
             continue
-        payload = o.get("payload") or {}
-        if o.get("type") == "turn_context":
-            model = payload.get("model") or model
+        kind, p = o.get("type"), o.get("payload")
+        if not isinstance(p, dict):
             continue
-        info = payload.get("info") or {}
-        total, last, ts = info.get("total_token_usage"), info.get("last_token_usage") or {}, parse_ts(o.get("timestamp"))
-        if payload.get("type") != "token_count" or not total or not ts or not model:
+        ts = parse_ts(o.get("timestamp"))
+        t, sub = ts.timestamp() if ts else None, p.get("type")
+        if kind == "turn_context":
+            yield "model", t, p.get("model")
+        elif kind == "event_msg" and sub == "task_started":
+            imported = str(p.get("turn_id") or "").startswith("external-import")
+            if not imported:
+                yield "start", p.get("started_at") or t, None
+        elif imported:
             continue
-        cur = [total.get(k) or 0 for k in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
-                                           "output_tokens")]
-        delta = [c - p for c, p in zip(cur, prev)] if prev and all(c >= p for c, p in zip(cur, prev)) else cur
-        prev = cur
-        if not any(delta):
-            continue
-        inp, cached, write, out = delta
-        key = model + ("|long" if (last.get("input_tokens") or 0) > (long_threshold(model) or 1e18) else "")
-        add_usage(usage, ts.astimezone().strftime("%Y-%m-%d"), key,
-                  [max(0, inp - cached - write), out, write, 0, cached, 0])
-    return usage
+        elif kind == "event_msg" and sub in ("task_complete", "turn_aborted"):
+            err = p.get("error")
+            err = (err.get("message") if isinstance(err, dict) else err) or ""
+            end = p.get("completed_at") or t
+            yield "end", end, (p.get("started_at"), end, str(err))
+        elif kind == "event_msg" and sub == "token_count":
+            yield "tokens", t, p.get("info") or {}
+        elif kind == "event_msg" and sub == "item_completed":
+            item = p.get("item") or {}
+            if item.get("type") == "UserMessage":
+                yield "user", t, codex_text(item.get("content"))
+            elif item.get("type") == "AgentMessage":
+                yield "agent", t, codex_text(item.get("content"))
+            elif item.get("type") not in CODEX_NOT_TOOLS:
+                yield "tool", t, item
+        elif kind == "event_msg" and sub in ("user_message", "agent_message") and not items:
+            yield sub.split("_")[0], t, p.get("message") or ""
+        elif kind == "response_item" and sub in CODEX_CALLS:
+            body = p.get("arguments") or p.get("input") or p.get("action") or ""
+            yield ("call" if items else "tool"), t, {"type": "Call", "name": p.get("name") or sub,
+                                                     "command": body if isinstance(body, str) else json.dumps(body)}
 
 
-def codex_state(srv, t):
-    """A Codex thread summarised into the same fields a Claude transcript gets."""
+def codex_state(row, text):
+    """A Codex thread (its index row and session file) summarised into the same fields a Claude
+    transcript gets."""
     st = new_state()
-    st.update(cwd=t.get("cwd"), model=t.get("model"), ai_title=t.get("name") or None,
-              branch=(t.get("gitInfo") or {}).get("branch"))
-    st["usage"] = codex_usage(t.get("path"), t.get("model"))
-    turns, cursor = [], None
-    while len(turns) < 5000:
-        params = {"threadId": t["id"], "limit": 50, "itemsView": "full", "sortDirection": "asc"}
-        if cursor:
-            params["cursor"] = cursor
-        page = srv.request("thread/turns/list", params)
-        turns += page.get("data") or []
-        cursor = page.get("nextCursor")
-        if not cursor:
-            break
-    first, last, prev_end = None, None, None
-    for turn in turns:
-        end = turn.get("completedAt")
-        start = turn.get("startedAt") or (end - (turn.get("durationMs") or 0) / 1000 if end else None)
-        if start is None:
-            continue
-        end = end or start
-        day = datetime.fromtimestamp(start).strftime("%Y-%m-%d")
-        work = max(0.0, end - start)
-        if prev_end is not None and 0 < start - prev_end <= GAP:
-            work += start - prev_end
+    st.update(cwd=row.get("cwd"), ai_title=row.get("name") or None, branch=row.get("git_branch"))
+    model, usage, prev = row.get("model"), {}, None
+    span = {"first": None, "last": None, "prev_end": None}
+    start, err, seen = None, "", None
+
+    def turn(a, b):
+        b = max(a, b or a)
+        work = b - a
+        if span["prev_end"] is not None and 0 < a - span["prev_end"] <= GAP:
+            work += a - span["prev_end"]
         st["active"] += work
+        day = datetime.fromtimestamp(a).strftime("%Y-%m-%d")
         st["days"][day] = st["days"].get(day, 0) + work
-        prev_end = end
-        first = start if first is None else min(first, start)
-        last = end if last is None else max(last, end)
-        for item in turn.get("items") or []:
-            if item.get("type") == "userMessage":
-                add_links(st, HANDOFF_RE, item_text(item))
-                txt = clean_part(item_text(item))
-                if not txt:
-                    continue
-                st["user"] += 1
-                st["last_prompt_ts"] = iso(start)
-                entry = [iso(start), txt[:400]]
-                if len(st["first_prompts"]) < 5:
-                    st["first_prompts"].append(entry)
-                else:
-                    st["last_prompts"] = (st["last_prompts"] + [entry])[-4:]
-            elif item.get("type") == "agentMessage" and (item.get("text") or "").strip():
-                st["assistant"] += 1
-                st["last_said"] = [iso(end), WS_RE.sub(" ", item["text"]).strip()[:300]]
-            elif item.get("type") in ("commandExecution", "fileChange", "mcpToolCall",
-                                      "dynamicToolCall", "webSearch"):
-                st["tools"] += 1
-                if item.get("type") == "commandExecution":
-                    add_links(st, READS_CLAUDE_RE, item.get("command"))
-    st["first"] = iso(first or t.get("createdAt") or 0)
-    st["last"] = iso(max(x for x in (last, t.get("updatedAt"), first, 0) if x is not None))
-    err = ((turns[-1].get("error") or {}).get("message") or "") if turns else ""
-    if turns and turns[-1].get("status") == "failed" and ("context_length_exceeded" in err
-                                                         or "context window" in err):
+        span["prev_end"] = b
+        span["first"] = a if span["first"] is None else min(span["first"], a)
+        span["last"] = b if span["last"] is None else max(span["last"], b)
+
+    for kind, t, v in codex_events(text or ""):
+        seen = max(seen or 0, t or 0) or seen
+        if kind == "start":
+            start = t
+        elif kind == "end":
+            a = v[0] or start or v[1]
+            if a:
+                turn(a, v[1])
+            start, err = None, v[2]
+        elif kind == "model":
+            model = v or model
+        elif kind == "tokens":
+            total, last = v.get("total_token_usage"), v.get("last_token_usage") or {}
+            if not total or not t or not model:
+                continue
+            cur = [total.get(k) or 0 for k in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                                               "output_tokens")]
+            delta = [c - p for c, p in zip(cur, prev)] if prev and all(c >= p for c, p in zip(cur, prev)) else cur
+            prev = cur
+            if not any(delta):
+                continue
+            inp, cached, write, out = delta
+            key = model + ("|long" if (last.get("input_tokens") or 0) > (long_threshold(model) or 1e18) else "")
+            add_usage(usage, datetime.fromtimestamp(t).strftime("%Y-%m-%d"), key,
+                      [max(0, inp - cached - write), out, write, 0, cached, 0])
+        elif kind == "user":
+            add_links(st, HANDOFF_RE, v)
+            txt = clean_part(v or "")
+            if not txt:
+                continue
+            st["user"] += 1
+            st["last_prompt_ts"] = iso(t or start or 0)
+            entry = [st["last_prompt_ts"], txt[:400]]
+            if len(st["first_prompts"]) < 5:
+                st["first_prompts"].append(entry)
+            else:
+                st["last_prompts"] = (st["last_prompts"] + [entry])[-4:]
+        elif kind == "agent" and (v or "").strip():
+            st["assistant"] += 1
+            st["last_said"] = [iso(t or 0), WS_RE.sub(" ", v).strip()[:300]]
+        elif kind in ("tool", "call"):
+            st["tools"] += kind == "tool"
+            add_links(st, READS_CLAUDE_RE, codex_command(v))
+    if start is not None:  # a turn still running
+        turn(start, seen)
+    st["model"], st["usage"] = model, usage
+    # where you last worked: the last turn, not the index's updated time, which other things touch
+    st["first"] = iso(span["first"] or row.get("created_at") or 0)
+    st["last"] = iso(span["last"] or row.get("updated_at") or row.get("created_at") or 0)
+    if "context_length_exceeded" in err or "context window" in err:
         st["broken"] = "too big for Codex's context window"  # every new turn fails the same way
     return st
 
 
+def codex_parent(row, text):
+    """The thread a Codex subagent or reviewer thread worked for."""
+    try:
+        spawn = (json.loads(row.get("source") or "{}").get("subagent") or {}).get("thread_spawn") or {}
+    except (ValueError, AttributeError):
+        spawn = {}
+    if spawn.get("parent_thread_id"):
+        return spawn["parent_thread_id"]
+    first = (text or "").split("\n", 1)[0]
+    try:
+        meta = json.loads(first).get("payload") or {}
+    except ValueError:
+        return None
+    parent = meta.get("parent_thread_id") or meta.get("session_id")
+    return parent if parent and parent != row.get("id") else None
+
+
 def load_codex(days, rescan=False):
-    """-> (Codex sessions touched in the window, note). Read through `codex app-server` only when
-    Codex's own files changed since the last run; otherwise straight from the cache."""
-    if not shutil.which("codex") or not os.path.isdir(CODEX_HOME):
+    """-> (Codex sessions touched in the window, note), from Codex's thread index and session
+    files. A thread is read again only when its file changed. Work Codex's subagents and
+    reviewers did counts toward the thread they worked for."""
+    if not os.path.isdir(CODEX_HOME):
         return [], None
     try:
         with open(CODEX_CACHE) as f:
@@ -859,44 +950,67 @@ def load_codex(days, rescan=False):
         cache = {}
     if cache.get("__version__") != CODEX_CACHE_VERSION:
         cache = {}
-    threads, note = cache.get("threads") or {}, None
-    stamp = codex_stamp()
+    old, note = cache.get("threads") or {}, None
     horizon = time.time() - days * 86400
-    if rescan or cache.get("stamp") != stamp or cache.get("days", 0) < days:
+    threads, dirty = {}, False
+    try:
+        db = codex_db()
+        if db is None:
+            return [], None
         try:
-            fresh, cursor = {}, None
-            with CodexServer(HOME) as srv:
-                while True:
-                    params = {"limit": 50, "sortKey": "updated_at", "sortDirection": "desc",
-                              "sourceKinds": ["cli", "vscode", "appServer"]}
-                    if cursor:
-                        params["cursor"] = cursor
-                    page = srv.request("thread/list", params)
-                    old_enough = False
-                    for t in page.get("data") or []:
-                        updated = t.get("updatedAt") or 0
-                        if updated < horizon:
-                            old_enough = True
-                            break
-                        prev = threads.get(t["id"])
-                        if prev and prev.get("updated") == updated and not rescan:
-                            fresh[t["id"]] = prev
-                        else:
-                            fresh[t["id"]] = {"updated": updated, "st": codex_state(srv, t)}
-                    cursor = page.get("nextCursor")
-                    if old_enough or not cursor:
-                        break
-            threads = fresh
+            rows = [dict(r) for r in db.execute("select * from threads where updated_at >= ?", (int(horizon),))]
+            try:
+                edges = dict(db.execute("select child_thread_id, parent_thread_id from thread_spawn_edges"))
+            except sqlite3.Error:
+                edges = {}
+        finally:
+            db.close()
+        for r in rows:
+            source = r.get("source") or ""
+            child = source.startswith("{")  # {"subagent": ...}
+            if (not child and (source == "exec" or r.get("archived"))) or not r.get("id"):
+                continue  # `codex exec` runs and archived threads are not sessions to show
+            path = rollout_file(r.get("rollout_path"))
+            try:
+                fs = os.stat(path) if path else None
+            except OSError:
+                fs = None
+            sig = [path, fs.st_mtime if fs else None, fs.st_size if fs else None,
+                   r.get("updated_at"), r.get("name"), r.get("git_branch")]
+            prev = old.get(r["id"])
+            if prev and prev.get("sig") == sig and not rescan:
+                threads[r["id"]] = prev
+                continue
+            text = read_rollout(path) if path else None
+            threads[r["id"]] = {"sig": sig, "rollout": path, "child": child, "st": codex_state(r, text),
+                                "parent": (edges.get(r["id"]) or codex_parent(r, text)) if child else None}
+            dirty = True
+        if dirty or set(threads) != set(old):
             os.makedirs(CACHE_DIR, exist_ok=True)
             tmp = CODEX_CACHE + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"__version__": CODEX_CACHE_VERSION, "stamp": stamp, "days": days,
-                           "threads": threads}, f)
+                json.dump({"__version__": CODEX_CACHE_VERSION, "threads": threads}, f)
             os.replace(tmp, CODEX_CACHE)
-        except (CodexError, OSError, ValueError) as e:
-            note = f"codex: {e} (showing its sessions as of the last run)"
-    out = [dict(id=tid, path=None, project_dir="", host=None, app="codex", **entry["st"])
-           for tid, entry in threads.items() if entry["updated"] >= horizon]
+    except (sqlite3.Error, OSError, ValueError) as e:
+        note = f"codex: cannot read its sessions ({e}); showing them as of the last run"
+        threads = old
+    work_for = {}
+    for tid, e in threads.items():
+        if not e.get("child"):
+            continue
+        boss, hops = e.get("parent"), 0
+        while boss in threads and threads[boss].get("child") and hops < 10:
+            boss, hops = threads[boss].get("parent"), hops + 1
+        work_for.setdefault(boss, []).append(e["st"].get("usage"))
+    out = []
+    for tid, e in threads.items():
+        if e.get("child"):
+            continue
+        st = dict(e["st"])
+        if tid in work_for:
+            st["usage"] = merge_usage(st.get("usage"), *work_for[tid])
+        out.append(dict(id=tid, path=None, rollout=e.get("rollout"), project_dir="", host=None,
+                        app="codex", **st))
     return out, note
 
 
@@ -926,77 +1040,90 @@ def claude_to_codex(s):
     return ids[-1]
 
 
-def codex_item_lines(item):
-    kind = item.get("type")
-    if kind == "userMessage":
-        txt = item_text(item).strip()
-        return ["**You:** " + txt] if txt else []
-    if kind == "agentMessage" and (item.get("text") or "").strip():
-        return ["**Codex:** " + item["text"].strip()]
-    if kind == "plan" and item.get("text"):
-        return ["**Plan:**\n" + item["text"].strip()]
-    if kind == "commandExecution":
-        actions = item.get("commandActions") or []
-        cmd = (actions[0].get("command") if actions else None) or item.get("command") or ""
-        code = item.get("exitCode")
-        return [f"- ran `{WS_RE.sub(' ', cmd)[:300]}`" + (f" (exit {code})" if code not in (0, None) else "")]
-    if kind == "fileChange":
-        paths = [ch.get("path") for ch in item.get("changes") or [] if ch.get("path")]
+def codex_lines(kind, v):
+    """A Codex event as transcript lines for Claude to read."""
+    if kind in ("user", "agent"):
+        txt = (v or "").strip()
+        return [("**You:** " if kind == "user" else "**Codex:** ") + txt] if txt else []
+    if kind != "tool":
+        return []
+    t = v.get("type")
+    if t == "CommandExecution":
+        code = v.get("exit_code")
+        return [f"- ran `{WS_RE.sub(' ', codex_command(v))[:300]}`" + (f" (exit {code})" if code not in (0, None) else "")]
+    if t == "FileChange":
+        ch = v.get("changes") or {}
+        paths = list(ch) if isinstance(ch, dict) else [x.get("path") for x in ch if isinstance(x, dict) and x.get("path")]
         return ["- changed " + ", ".join(paths)] if paths else []
-    if kind == "mcpToolCall":
-        return [f"- used {item.get('server')}.{item.get('tool')}"]
-    if kind == "webSearch" and item.get("query"):
-        return ["- searched the web: " + item["query"]]
+    if t == "McpToolCall":
+        return [f"- used {v.get('server')}.{v.get('tool')}"]
+    if t in ("WebSearch", "Extension") and v.get("query"):
+        return ["- searched the web: " + v["query"]]
+    if t == "Call":
+        return [f"- used {v.get('name')}"]
     return []
 
 
-def codex_handoff(s):
-    """Write a Codex thread's transcript (its most recent part) for Claude to read. -> path."""
-    blocks, size, cursor, more = [], 0, None, False
-    with CodexServer(s.get("cwd") or HOME) as srv:
-        while not more:
-            params = {"threadId": s["id"], "limit": 25, "itemsView": "full", "sortDirection": "desc"}
-            if cursor:
-                params["cursor"] = cursor
-            page = srv.request("thread/turns/list", params)
-            for turn in page.get("data") or []:
-                text = "\n\n".join(ln for item in turn.get("items") or [] for ln in codex_item_lines(item))
-                if not text:
-                    continue
-                if blocks and size + len(text) > HANDOFF_MAX:
-                    more = True
-                    break
-                blocks.append(text)
-                size += len(text)
-            cursor = page.get("nextCursor")
-            if not cursor:
-                break
-    blocks.reverse()
+def handoff_file(sid, since):
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    stem = sid if since is None else f"{datetime.now():%Y%m%d-%H%M}-{sid}"  # a catch-up keeps the earlier file
+    return os.path.join(HANDOFF_DIR, stem + ".md")
+
+
+def codex_handoff(s, since=None):
+    """Write a Codex thread's transcript for Claude to read: its most recent part, or only the turns
+    after `since` (unix time). -> path, or None when nothing happened after `since`."""
+    turns = []
+    for kind, t, v in codex_events(read_rollout(s.get("rollout")) or ""):
+        if kind == "start" or not turns:
+            turns.append([t, []])
+        turns[-1][1] += codex_lines(kind, v)
+    if since is not None:
+        turns = [x for x in turns if (x[0] or 0) > since]
+    texts = ["\n\n".join(lines) for _, lines in turns if lines]
+    if since is not None and not texts:
+        return None
+    kept, size = [], 0
+    for text in reversed(texts):
+        if kept and size + len(text) > HANDOFF_MAX:
+            break
+        kept.append(text)
+        size += len(text)
+    kept.reverse()
     head = [f"# Codex session: {name(s)}", "", f"- Thread: `{s['id']}`", f"- Folder: {s.get('cwd') or '?'}",
             f"- Model: {s.get('model') or '?'}", f"- Last active: {when(s['last'])}"]
-    if more:
+    if since is not None:
+        head.append(f"- Only what happened since {when(iso(since))}")
+    if len(kept) < len(texts):
         head.append(f"- Earlier turns are left out; the whole thread: `codex resume {s['id']}`")
-    os.makedirs(HANDOFF_DIR, exist_ok=True)
-    path = os.path.join(HANDOFF_DIR, s["id"] + ".md")
+    path = handoff_file(s["id"], since)
     with open(path, "w") as f:
-        f.write("\n".join(head) + "\n\n---\n\n" + "\n\n---\n\n".join(blocks) + "\n")
+        f.write("\n".join(head) + "\n\n---\n\n" + "\n\n---\n\n".join(kept) + "\n")
     return path
 
 
-def handoff_prompt(path, source="codex"):
+def handoff_prompt(path, source="codex", title=None):
+    lead = f"Continuing \"{title}\". " if title else ""
     if source == "claude":
-        return (f"I'm switching to you from a Claude Code session in this folder. It is too long to "
+        return (f"{lead}I'm switching to you from a Claude Code session in this folder. It is too long to "
                 f"import whole, so here is Claude's summary of the earlier work plus the most recent "
                 f"part: {path}. Read it, then tell me in a few lines where that session left off and "
                 f"what is still open. Don't start new work until I say so.")
-    return (f"I'm switching to you from a Codex (GPT) session in this folder. Its transcript is at "
+    return (f"{lead}I'm switching to you from a Codex (GPT) session in this folder. Its transcript is at "
             f"{path}. Read it, then tell me in a few lines where that session left off and what is "
             f"still open. Don't start new work until I say so.")
 
 
+def catchup_prompt(path, source):
+    tool = "Codex (GPT)" if source == "codex" else "Claude Code"
+    return (f"Since your last turn here, this conversation continued in {tool}; what happened there is in "
+            f"{path}. Read it, then tell me in a few lines where things stand now and what is still "
+            f"open. Don't start new work until I say so.")
+
+
 def read_claude(path):
     """One pass over a Claude transcript -> (estimated tokens of the conversation, Claude's latest
-    compaction summary, the conversation as short markdown entries)."""
+    compaction summary, the conversation as (unix time, short markdown) entries)."""
     chars, summary, entries = 0, None, []
     with open(path, errors="ignore") as f:
         for line in f:
@@ -1008,6 +1135,8 @@ def read_claude(path):
                 continue
             if o.get("type") not in ("user", "assistant") or o.get("isSidechain"):
                 continue
+            ts = parse_ts(o.get("timestamp"))
+            t = ts.timestamp() if ts else None
             content = (o.get("message") or {}).get("content")
             blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
             for b in blocks:
@@ -1017,10 +1146,10 @@ def read_claude(path):
                 if kind == "text":
                     chars += len(b.get("text") or "")
                     if o.get("type") == "assistant" and (b.get("text") or "").strip():
-                        entries.append("**Claude:** " + b["text"].strip())
+                        entries.append((t, "**Claude:** " + b["text"].strip()))
                 elif kind == "tool_use":
                     chars += len(json.dumps(b.get("input")))
-                    entries.append("- used " + f"{b.get('name')}: {tool_summary(b.get('name'), b.get('input') or {})}")
+                    entries.append((t, "- used " + f"{b.get('name')}: {tool_summary(b.get('name'), b.get('input') or {})}"))
                 elif kind == "tool_result":
                     body = b.get("content")
                     chars += len(body if isinstance(body, str) else json.dumps(body))
@@ -1032,7 +1161,7 @@ def read_claude(path):
                     continue
                 txt = prompt_text(content)
                 if txt:
-                    entries.append("**You:** " + txt)
+                    entries.append((t, "**You:** " + txt))
     return chars // 4, summary, entries
 
 
@@ -1042,11 +1171,16 @@ def claude_text_of(content):
     return "\n".join(b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
 
 
-def claude_handoff(s, summary, entries):
+def claude_handoff(s, summary, entries, since=None):
     """Write a Claude conversation for Codex to read: Claude's summary of the earlier work plus
-    the most recent part. -> path."""
+    the most recent part, or only what happened after `since` (unix time). -> path, or None when
+    nothing happened after `since`."""
+    if since is not None:
+        entries, summary = [e for e in entries if (e[0] or 0) > since], None
+        if not entries:
+            return None
     kept, size = [], 0
-    for entry in reversed(entries):
+    for _, entry in reversed(entries):
         if kept and size + len(entry) > HANDOFF_MAX:
             break
         kept.append(entry)
@@ -1055,13 +1189,14 @@ def claude_handoff(s, summary, entries):
     head = [f"# Claude Code session: {name(s)}", "", f"- Session: `{s['id']}`",
             f"- Folder: {s.get('cwd') or '?'}", f"- Last active: {when(s['last'])}",
             f"- The whole transcript: {s['path']}"]
+    if since is not None:
+        head.append(f"- Only what happened since {when(iso(since))}")
     parts = ["\n".join(head)]
     if summary:
         parts.append("## Claude's summary of the earlier work\n\n" + summary.strip())
-    parts.append("## The most recent part" + (" (earlier turns left out)" if len(kept) < len(entries) else "")
-                 + "\n\n" + "\n\n".join(kept))
-    os.makedirs(HANDOFF_DIR, exist_ok=True)
-    path = os.path.join(HANDOFF_DIR, s["id"] + ".md")
+    parts.append(("## What happened" if since is not None else "## The most recent part")
+                 + (" (earlier turns left out)" if len(kept) < len(entries) else "") + "\n\n" + "\n\n".join(kept))
+    path = handoff_file(s["id"], since)
     with open(path, "w") as f:
         f.write("\n\n---\n\n".join(parts) + "\n")
     return path
@@ -1344,6 +1479,7 @@ STATUS_COLOR = {"live": "32", "waiting": "33", "done": "", "fired": "", "dead": 
 
 _JOB_INDEX = None
 _ALL_SESSIONS = []
+SESSION_INDEX = {}  # (host, id) -> session, every machine's
 
 
 def job_index():
@@ -1499,6 +1635,18 @@ def start_remote(hosts, days):
     return {"procs": procs, "days": days, "started": time.monotonic()}
 
 
+def cached_remote(hosts, days):
+    """Every host's last answer, without asking again."""
+    out = []
+    for label in hosts:
+        try:
+            with open(remote_base(label, days) + ".json") as f:
+                out += [from_json(o, label) for o in json.load(f)]
+        except (OSError, ValueError):
+            pass
+    return out
+
+
 def finish_remote(pending, wait=REMOTE_WAIT):
     """[(label, sessions, note)]: fresh answers from hosts that replied within `wait` seconds,
     the last answer from the others."""
@@ -1648,6 +1796,8 @@ def physical_project(logical, home):
 
 
 def physical_path(logical):
+    if logical.startswith("codex/"):
+        return os.path.join(CODEX_HOME, logical[len("codex/"):])
     if logical.startswith("memory/"):
         _, proj, rest = logical.split("/", 2)
         return os.path.join(PROJECTS, physical_project(proj, HOME), "memory", rest)
@@ -1655,6 +1805,8 @@ def physical_path(logical):
 
 
 def pretty_logical(logical):
+    if logical == CODEX_FILE:
+        return "codex: settings in config.toml and profiles (trusted folders, hook approvals, model, ...)"
     return logical.replace("memory/HOME", "memory/~", 1)
 
 
@@ -1669,13 +1821,24 @@ def sync_paths(items):
         for d in CONFIG_DIRS:
             for root, dirs, files in os.walk(os.path.join(CLAUDE_DIR, d)):
                 rel = os.path.relpath(root, CLAUDE_DIR)
-                if any(rel == s or rel.startswith(s + "/") for s in SYNC_SKIP_DIRS):
+                if (any(rel == s or rel.startswith(s + "/") for s in SYNC_SKIP_DIRS)
+                        or any(part.startswith(".") for part in rel.split("/"))):  # e.g. skills/.trash
                     dirs[:] = []
                     continue
                 for fn in files:
                     p = os.path.join(root, fn)
                     if not fn.startswith(".") and os.path.getsize(p) <= SYNC_MAX_FILE:
                         out[os.path.join(rel, fn)] = p
+        for f in CODEX_FILES:  # Codex: instructions, hooks and command rules, as whole files
+            p = os.path.join(CODEX_HOME, f)
+            if os.path.isfile(p):
+                out["codex/" + f] = p
+        for d in CODEX_DIRS:
+            for root, _, files in os.walk(os.path.join(CODEX_HOME, d)):
+                for fn in files:
+                    p = os.path.join(root, fn)
+                    if not fn.startswith(".") and ".bak" not in fn and os.path.getsize(p) <= SYNC_MAX_FILE:
+                        out["codex/" + os.path.relpath(p, CODEX_HOME)] = p
     if "memory" in items and os.path.isdir(PROJECTS):
         for ent in os.scandir(PROJECTS):
             mem = os.path.join(ent.path, "memory")
@@ -1706,6 +1869,170 @@ def mcp_bytes():
     return (json.dumps(servers, indent=1, sort_keys=True) + "\n").encode()
 
 
+# Codex's settings live in TOML files that also hold what only one machine should have (the
+# ChatGPT app's window preferences and plugin cache paths, ai-bridge's copy of the MCP servers),
+# so a sync takes only the portable parts, setting by setting, as the exact lines Codex wrote:
+# top-level settings, trusted folders, hook approvals and a few preference tables. Text, not a
+# TOML library: a Mac's own python3 (3.9) has none.
+CODEX_FILE = "codex-settings.json"  # the portable parts of ~/.codex/config.toml and *.config.toml
+CODEX_FILES = ("AGENTS.md", "hooks.json")
+CODEX_DIRS = ("rules",)
+CODEX_TABLES = re.compile(r"(projects\.|hooks\.state|tui$|tui\.|sandbox_workspace_write$|permissions\.)")
+TOML_HEADER = re.compile(r"\[([^\[\]]+)\]\s*(?:#.*)?$")
+TOML_KEY = re.compile(r'([A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*")\s*=')
+
+
+def toml_depth(line):
+    """How many brackets/braces a line leaves open, ignoring those inside strings and comments."""
+    depth, quote, i = 0, None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            break
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def toml_sections(text):
+    """[[header or None, [(key or None, raw text)]]]: the part before the first table, then each
+    table; a setting's raw text includes the lines its value continues on."""
+    out, open_key, depth = [[None, []]], None, 0
+    for line in text.splitlines(keepends=True):
+        if open_key is not None:
+            out[-1][1][-1] = (open_key, out[-1][1][-1][1] + line)
+            depth += toml_depth(line)
+            if depth <= 0:
+                open_key = None
+            continue
+        m = TOML_HEADER.match(line.rstrip("\n")) if line.startswith("[") and not line.startswith("[[") else None
+        if m:
+            out.append([m.group(1).strip(), []])
+            continue
+        k = TOML_KEY.match(line)
+        if k:
+            out[-1][1].append((k.group(1), line))
+            depth = toml_depth(line[k.end():])
+            if depth > 0:
+                open_key = k.group(1)
+        else:
+            out[-1][1].append((None, line))
+    return out
+
+
+def codex_portable_of(text):
+    """{"top": {key: raw}, "tables": {header: {key: raw}}}: what a sync carries of one TOML file."""
+    top, tables = {}, {}
+    for header, entries in toml_sections(text):
+        if header is not None and not CODEX_TABLES.match(header):
+            continue
+        keys = {k: raw if raw.endswith("\n") else raw + "\n" for k, raw in entries if k}
+        if header is None:
+            top = keys
+        else:
+            tables.setdefault(header, {}).update(keys)
+    return {"top": top, "tables": tables}
+
+
+def codex_toml_files():
+    out = {}
+    for p in [os.path.join(CODEX_HOME, "config.toml")] + sorted(glob.glob(os.path.join(CODEX_HOME, "*.config.toml"))):
+        if os.path.isfile(p):
+            out[os.path.basename(p)] = p
+    return out
+
+
+def codex_settings_bytes():
+    files = codex_toml_files()
+    if not files:
+        return None, 0
+    data = {}
+    for name_, p in files.items():
+        with open(p, errors="replace") as f:
+            data[name_] = codex_portable_of(f.read())
+    return (json.dumps(data, indent=1, sort_keys=True) + "\n").encode(), max(os.path.getmtime(p) for p in files.values())
+
+
+def codex_apply_portable(text, want):
+    """text with the portable settings in `want` put in: a changed setting replaced where it is,
+    a new one added to its table (or a new table at the end). Nothing is removed."""
+    sections = toml_sections(text)
+
+    def put(section, key, raw):
+        entries = section[1]
+        for i, (k, old) in enumerate(entries):
+            if k == key:
+                entries[i] = (k, raw)
+                return
+        last = max([i for i, (k, _) in enumerate(entries) if k] or [-1])
+        entries.insert(last + 1, (key, raw))
+
+    for key, raw in want.get("top", {}).items():
+        put(sections[0], key, raw)
+    for header, keys in want.get("tables", {}).items():
+        section = next((s for s in sections if s[0] == header), None)
+        if section is None:
+            section = [header, [], True]
+            sections.append(section)
+        for key, raw in keys.items():
+            put(section, key, raw)
+    out = []
+    for header, entries, *new in sections:
+        if new and out and out[-1].strip():  # a table this file did not have: after a blank line
+            out.append("\n")
+        if header is not None:
+            out.append(f"[{header}]\n")
+        out.extend(raw if raw.endswith("\n") else raw + "\n" for _, raw in entries)
+    return "".join(out)
+
+
+def codex_write_settings(data, keep):
+    """Apply a merged codex-settings.json here. -> names of the files changed."""
+    changed = []
+    for fname, want in sorted(data.items()):
+        if "/" in fname or not (fname == "config.toml" or fname.endswith(".config.toml")):
+            continue
+        p = os.path.join(CODEX_HOME, fname)
+        try:
+            with open(p, errors="replace") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        new = codex_apply_portable(text, want)
+        if new == text:
+            continue
+        try:  # where Python can read TOML, refuse to write a file Codex couldn't
+            import tomllib
+            tomllib.loads(new)
+        except ImportError:
+            pass
+        except ValueError as e:
+            print(c("33", f"skipped ~/.codex/{fname}: the merged file would not parse ({e})"), file=sys.stderr)
+            continue
+        keep(p, "codex/" + fname)
+        os.makedirs(CODEX_HOME, exist_ok=True)
+        tmp = p + ".s-tmp"
+        with open(tmp, "w") as f:
+            f.write(new)
+        if os.path.exists(p):
+            shutil.copymode(p, tmp)
+        else:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+        changed.append(fname)
+    return changed
+
+
 def sha(data):
     import hashlib
     return hashlib.sha256(data).hexdigest()
@@ -1722,6 +2049,9 @@ def local_snapshot(items):
         data = mcp_bytes()
         if data is not None:
             snap[MCP_FILE] = {"hash": sha(data), "mtime": os.path.getmtime(claude_json_path()), "data": data}
+        data, mtime = codex_settings_bytes()
+        if data is not None:
+            snap[CODEX_FILE] = {"hash": sha(data), "mtime": mtime, "data": data}
     return snap
 
 
@@ -1794,6 +2124,10 @@ def apply_changes(writes, deletes):
                 o = {}
             o["mcpServers"] = json.loads(entry["data"])
             put(p, (json.dumps(o, indent=2) + "\n").encode(), None)
+            if shutil.which("ai-bridge"):  # Codex's copy of the MCP servers follows Claude's
+                subprocess.run(["ai-bridge", "sync", "--quiet"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif logical == CODEX_FILE:
+            codex_write_settings(json.loads(entry["data"]), keep)
         else:
             p = physical_path(logical)
             keep(p, logical)
@@ -1842,13 +2176,13 @@ def merge_index(a, b, prefer_a):
 
 def merge_entry(logical, le, re_, prefer_local):
     """Merged bytes for the few files that should be combined instead of overwritten, else None."""
-    if logical in ("settings.json", MCP_FILE):
+    if logical in ("settings.json", MCP_FILE, CODEX_FILE):
         try:
             merged = merge_json(json.loads(le["data"]), json.loads(re_["data"]), prefer_local)
         except ValueError:
             return None
         return (json.dumps(merged, indent=2 if logical == "settings.json" else 1,
-                           sort_keys=logical == MCP_FILE) + "\n").encode()
+                           sort_keys=logical != "settings.json") + "\n").encode()
     if logical.startswith("memory/") and logical.endswith("/MEMORY.md"):
         return merge_index(le["data"], re_["data"], prefer_local)
     return None
@@ -2181,35 +2515,34 @@ def print_list(view, start=0, count=None):
         fixed += 5 + len(gutter)
     if show_proj:
         fixed += pw + len(gutter)
-    if cols - fixed - 1 < 24 and show_proj:  # narrow terminal: the prompt matters more than the folder
-        show_proj, fixed = False, fixed - pw - len(gutter)
-    if cols - fixed - 1 < 24:
-        shrink = min(nw - 20, 24 - (cols - fixed - 1))
+    for floor in (26, 20):  # narrow terminal: shorter names first, then no folder, then shorter still
+        shrink = min(nw - floor, 24 - (cols - fixed - 1))
         if shrink > 0:
             nw, fixed = nw - shrink, fixed - shrink
+        if cols - fixed - 1 < 24 and show_proj and floor == 26:  # the prompt matters more than the folder
+            show_proj, fixed = False, fixed - pw - len(gutter)
     lw = max(16, cols - fixed - 1)
 
-    def row(idx, flag, host, app, last, work, nm, proj, prompt, header=False):
-        cells = [(f"{idx:>3}", "1;36"), (flag, None)]
-        if hw:
-            cells.append((f"{host:<{hw}}", "35"))
-        if show_app:
-            cells.append((f"{app:<7}", APP_COLOR.get(app.strip(" ⇄"), "")))
-        cells.append((f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else ""))
-        if show_work:
-            cells.append((f"{work:>5}", ""))
-        cells.append((f"{nm:<{nw}}", "1"))
+    def row(idx, flag, nm, proj, app, host, last, prompt, work, header=False):
+        cells = [(f"{idx:>3}", "1;36"), (flag, None), (f"{nm:<{nw}}", "1")]
         if show_proj:
             cells.append((f"{proj:<{pw}}", "2"))
-        cells.append((prompt, ""))
+        if show_app:
+            cells.append((f"{app:<7}", APP_COLOR.get(app.strip(" ⇄"), "")))
+        if hw:
+            cells.append((f"{host:<{hw}}", "35"))
+        cells.append((f"{last:<7}", "32" if ("m ago" in last or "h ago" in last) else ""))
+        cells.append((f"{prompt:<{lw}}" if show_work else prompt, ""))
+        if show_work:
+            cells.append((f"{work:>5}", ""))
         if header:
-            return c("2", gutter.join(t for t, _ in cells))
-        return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells)
+            return c("2", gutter.join(t for t, _ in cells).rstrip())
+        return gutter.join(t if code is None else (c(code, t) if code else t) for t, code in cells).rstrip()
 
-    print(row("#", "  ", "host", " app", "last", "work", "session", "project", "last prompt", header=True))
+    print(row("#", "  ", "name", "project", " app", "host", "last", "last prompt", " work", header=True))
     for i, s in enumerate(rows, start + 1):
-        print(row(i, flags(s), s.get("host") or "", app_cell(s), rel(s["last"]), hm(s["active_win"]),
-                  fit(name(s), nw), fit(short_project(s), pw), fit(last_prompt(s), lw)))
+        print(row(i, flags(s), fit(name(s), nw), fit(short_project(s), pw), app_cell(s), s.get("host") or "",
+                  rel(s["last"]), fit(last_prompt(s), lw), hm(s["active_win"])))
 
 
 def live_block(s, indent="   "):
@@ -2266,19 +2599,25 @@ DAYS = 14
 
 def local_argv(s, target, extra, prepared=None):
     """argv that continues s in `target` here. prepared, when switching tools: ("thread", id) for a
-    Claude conversation imported into Codex, or ("transcript", path) for one handed over as text."""
+    Claude conversation imported into Codex, ("transcript", path) for one handed over as text, or
+    ("catchup", path) for what the other tool did since s, its own session there, last ran."""
     kind, value = prepared or ("transcript", "<transcript>")
     if target == "claude":
         claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        # --add-dir=DIR, not --add-dir DIR: it takes any number of folders and would take the prompt too
+        if app_of(s) == "claude" and kind == "catchup":
+            return [claude, "--resume", s["id"], "--add-dir=" + HANDOFF_DIR, *extra, catchup_prompt(value, "codex")]
         if app_of(s) == "claude":
             return [claude, "--resume", s["id"], *extra]
-        return [claude, "--add-dir", HANDOFF_DIR, handoff_prompt(value, "codex"), *extra]
+        return [claude, "--add-dir=" + HANDOFF_DIR, *extra, handoff_prompt(value, "codex", s.get("custom_title") or s.get("ai_title"))]
     codex = shutil.which("codex") or "codex"
+    if app_of(s) == "codex" and kind == "catchup":
+        return [codex, *codex_args(), "resume", s["id"], *extra, catchup_prompt(value, "claude")]
     if app_of(s) == "codex":
         return [codex, *codex_args(), "resume", s["id"], *extra]
     if kind == "thread":
         return [codex, *codex_args(), "resume", value, *extra]
-    return [codex, *codex_args(), *extra, handoff_prompt(value, "claude")]
+    return [codex, *codex_args(), *extra, handoff_prompt(value, "claude", s.get("custom_title") or s.get("ai_title"))]
 
 
 def resume_command(s, extra, target=None, prepared=None):
@@ -2384,9 +2723,15 @@ def show(s):
                       f"conversation from its Claude session with --codex for a fresh thread on a summary."))
     print(c("1", "Resume   ") + resume_command(s, [])[1])
     other = "codex" if app_of(s) == "claude" else "claude"
-    print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"s {s['id'][:8]} --{other}"
-          + c("2", "   (imports the conversation into a Codex thread)" if other == "codex"
-              else "   (Claude reads the Codex transcript and picks up)"))
+    member = chain_member(s, other)
+    if member:
+        hint = (f"   (resumes its {APP_LABEL[other]} session {member['id'][:8]}"
+                + (f", which reads what happened here since)" if s["last"] > member["last"] else ")"))
+    elif other == "codex":
+        hint = "   (imports the conversation into a Codex thread)"
+    else:
+        hint = "   (Claude reads the Codex transcript and picks up)"
+    print(c("1", APP_LABEL[other].split()[0].ljust(9)) + f"s {s['id'][:8]} --{other}" + c("2", hint))
 
 
 def live_view(sessions):
@@ -2531,16 +2876,53 @@ def cost_view(rows, days, remote_notes, top):
                   f"{fit(name(s), nw):<{nw}}  {c('2', f'{where_of(s):<{pw}}')}  {c('2', s['id'][:8])}")
         print()
     if unknown:
-        print(c("33", "No price known for: " + ", ".join(f"{m} ({ktok(t)} tokens)" for m, t in unknown.items())))
+        print(c("33", "Not counted, no published price: " + ", ".join(
+            f"{m} ({ktok(t)} tokens{', ' + UNPRICED[m] if m in UNPRICED else ''})" for m, t in unknown.items())))
     print(c("2", f"List prices as of {PRICES_AS_OF}, from Anthropic's and OpenAI's pricing pages. Calls Claude Code makes "
-                 "for itself (titles, compaction) are not in its transcripts, so Claude totals can read a little low."))
+                 "for itself (titles, compaction, auto mode's safety checks) are not in its transcripts, so Claude "
+                 "totals can read a little low."))
 
 
-def resume(s, extra, dry_run, target=None):
+def chain_member(s, target):
+    """The newest session of s's conversation in `target` that can still be resumed, or None."""
+    for m in sorted(s.get("chain") or [], key=lambda m: m["last"], reverse=True):
+        found = SESSION_INDEX.get((s.get("host"), m["id"]))
+        if m["app"] == target and not m.get("broken") and found:
+            return found
+    return None
+
+
+def continue_in(s, member, extra, dry_run):
+    """Resume `member`, the conversation's own session in the other tool, and when s (newer) went
+    on without it, hand it what happened in s since."""
+    since = parse_ts(member["last"]).timestamp()
+    there, here = APP_LABEL[app_of(member)], APP_LABEL[app_of(s)]
+    prepared = None
+    if parse_ts(s["last"]).timestamp() > since + 1:
+        print(c("2", f"→ resuming this conversation's {there} session {member['id'][:8]}; "
+                     f"{'would write' if dry_run else 'writing'} what happened in {here} since for it to read"))
+        if dry_run:
+            path = "<transcript>"
+        elif app_of(s) == "codex":
+            path = codex_handoff(s, since)
+        else:
+            path = claude_handoff(s, None, read_claude(s["path"])[2], since)
+        if path:
+            prepared = ("catchup", path)
+            r = running_of(member)
+            if r and r.get("tmux"):
+                print(c("33", f"note: it is already running; tell it to read {path}"))
+    resume(member, extra, dry_run, prepared=prepared)
+
+
+def resume(s, extra, dry_run, target=None, prepared=None):
     target = target or app_of(s)
     native = target == app_of(s)
+    if not native and not is_remote(s):  # a remote session's own s does this there
+        member = chain_member(s, target)
+        if member:
+            return continue_in(s, member, extra, dry_run)
     r = running_of(s) if native else None
-    prepared = None
     if not is_remote(s):
         cwd = s.get("cwd")
         if not cwd or not os.path.isdir(cwd):
@@ -2554,7 +2936,10 @@ def resume(s, extra, dry_run, target=None):
                 if tokens <= IMPORT_MAX_TOKENS:
                     print(c("2", f"→ {'would import' if dry_run else 'importing'} this conversation "
                                  f"(~{tokens // 1000}k tokens) into Codex as a new thread"))
+                    login = login_stamp()
                     prepared = ("thread", "<new thread>" if dry_run else claude_to_codex(s))
+                    if login_stamp() != login:  # the importer refreshed the ChatGPT login: let it settle
+                        time.sleep(3)
                 else:
                     print(c("2", f"→ this conversation is ~{tokens // 1000}k tokens, more than Codex can take "
                                  f"whole, so Codex starts fresh on Claude's summary plus the recent part"))
@@ -2578,7 +2963,51 @@ def resume(s, extra, dry_run, target=None):
         return
     if not is_remote(s):
         os.chdir(s.get("cwd") or HOME)
+    if target == "codex" and not is_remote(s) and os.path.basename(argv[0]) == "codex":
+        sys.exit(run_codex(argv))
     os.execvp(argv[0], argv)
+
+
+LOGIN_REFUSED = b"unauthorized (401)"
+
+
+def login_stamp():
+    try:
+        return os.stat(os.path.join(CODEX_HOME, "auth.json")).st_mtime
+    except OSError:
+        return None
+
+
+def run_codex(argv):
+    """Run Codex in this terminal -> its exit code. When it can't start because the ChatGPT login
+    was refused, as happens while another Codex is refreshing that login, try once more."""
+    import signal
+    import threading
+    for attempt in (1, 2):
+        try:
+            p = subprocess.Popen(argv, stderr=subprocess.PIPE)
+        except OSError as e:
+            sys.exit(f"cannot start codex: {e}")
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # ctrl-c is Codex's, not s's
+        tail = [b""]
+
+        def pump():
+            for chunk in iter(lambda: os.read(p.stderr.fileno(), 65536), b""):
+                os.write(2, chunk)
+                tail[0] = (tail[0] + chunk)[-8192:]
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        rc = p.wait()
+        reader.join(0.5)
+        if rc == 0 or LOGIN_REFUSED not in tail[0]:
+            return rc
+        if attempt == 1:
+            print(c("33", "Codex's ChatGPT login was refused; trying again in a moment..."), file=sys.stderr)
+            time.sleep(3)
+    print(c("33", "Still refused. Sign in again with `codex login`, with the same ChatGPT account the "
+                  "ChatGPT app uses (they share one login)."), file=sys.stderr)
+    return rc
 
 
 # ----------------------------------------------------------------- pickers
@@ -2591,10 +3020,10 @@ def pick_fzf(view, self_path):
         r = running_of(s)
         mark = ("●" if r else " ") + ("↻" if s["jobs"] else " ")
         host = f"{(s.get('host') or ''):<8}" if HOSTS else ""
-        lines.append("\t".join([s["id"], mark + ("  " + host if host else ""),
-                                *([f"{app_cell(s):<7}"] if apps else []), f"{rel(s['last']):<7}",
-                                f"{hm(s['active_win']):>5}", fit(name(s), 38).ljust(38),
-                                fit(short_project(s), 18).ljust(18), last_prompt(s)]))
+        lines.append("\t".join([s["id"], mark, fit(name(s), 38).ljust(38), fit(short_project(s), 18).ljust(18),
+                                *([f"{app_cell(s):<7}"] if apps else []), *([host] if host else []),
+                                f"{rel(s['last']):<7}", fit(last_prompt(s), 60).ljust(60),
+                                f"{hm(s['active_win']):>5}"]))
     try:
         res = subprocess.run(
             ["fzf", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--tabstop=1",
@@ -2694,8 +3123,8 @@ def find(view, sessions, key):
             return view[idx - 1]
         sys.exit(f"no session #{key}; the list has {len(view)} entries")
     hits = [s for s in sessions if s["id"].startswith(key)]
-    if len(hits) == 1:
-        return hits[0]
+    if len({s["id"] for s in hits}) == 1:  # on two machines when it was moved: the copy worked on last
+        return max(hits, key=lambda s: s["last"])
     sys.exit(f"{'no' if not hits else 'ambiguous'} session id '{key}'")
 
 
@@ -2760,7 +3189,7 @@ def to_json(s):
 
 
 def main():
-    global _ALL_SESSIONS, HOSTS, TMUX_MODE, DAYS
+    global _ALL_SESSIONS, HOSTS, TMUX_MODE, DAYS, SESSION_INDEX
     argv = sys.argv[1:]
     if argv[:1] == ["_export"]:  # called over ssh by another machine's s
         items = argv[argv.index("--items") + 1].split(",") if "--items" in argv else ["memory", "configs"]
@@ -2857,11 +3286,14 @@ def main():
     notes = [codex_note] if codex_note else []
     if lookup and HOSTS and len([s for s in sessions if s["id"].startswith(lookup)]) != 1:
         pending = start_remote(HOSTS, a.days)
+    elif lookup and HOSTS:  # found here; the other machines' last answers can still hold a newer copy
+        sessions += cached_remote(HOSTS, a.days)
     if pending:
         for label, remote, note in finish_remote(pending):
             sessions += remote
             if note:
                 notes.append(f"{label}: {note}")
+    SESSION_INDEX = {(s.get("host"), s["id"]): s for s in sessions}
     if notes and not a.json:
         for n in notes:
             print(c("33", n), file=sys.stderr)
@@ -2903,8 +3335,9 @@ def main():
     query = " ".join(rest)
     if re.fullmatch(r"[0-9a-f][0-9a-f-]{7,}", query) and not a.print:
         exact = [s for s in sessions if s["id"].startswith(query)]
-        if len(exact) == 1:  # a session id opens exactly that session, even inside a chain
-            resume(exact[0], extra, a.dry_run, target)
+        if len({s["id"] for s in exact}) == 1:  # a session id opens exactly that session, even inside a chain
+            # (on two machines when it was moved: the copy worked on last)
+            resume(max(exact, key=lambda s: s["last"]), extra, a.dry_run, target)
             return
     if query.isdigit():
         resume(find(view, sessions, query), extra, a.dry_run, target)

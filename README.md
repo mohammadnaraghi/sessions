@@ -39,7 +39,7 @@ even when it lives on another computer, and in either tool.
 - **Your other computers too.** Add a machine once; its sessions join the list. Resuming one
   opens it there over ssh. Sessions running inside tmux are attached, not duplicated.
 - **Memories and settings travel with you.** Keep two machines in step with one command,
-  in both directions, with a plan shown first and backups kept.
+  in both directions, for Claude Code and Codex alike, with a plan shown first and backups kept.
 - **Private by design.** Plain Python files, no dependencies, no accounts, no servers. They read
   what Claude Code and Codex already store on your disk and talk only to machines you name.
 
@@ -107,16 +107,19 @@ and the sessions that cost the most, on every machine you added. It covers the l
 The numbers are worked out from the tokens each response used, as recorded in the transcripts:
 input, output, both cache-write lengths and cache reads, fast mode, US-only inference and web
 searches, at Anthropic's and OpenAI's published per-model prices (the date is printed with the
-result). A session's subagents and workflow agents count toward it, and a conversation that
-moved between the tools counts once. Checked against the cost snapshots Claude Code keeps in its
+result). A session's subagents and workflow agents count toward it (in Codex too: its subagent
+and reviewer threads count toward the thread they worked for), and a conversation that moved
+between the tools counts once. Checked against the cost snapshots Claude Code keeps in its
 transcripts, they match to the cent for most sessions; the calls Claude Code makes for itself, such as titles and compaction, are not in its
 transcripts, so Claude totals can read slightly low.
 
 ## Claude Code and Codex
 
-When the [Codex CLI](https://github.com/openai/codex) is installed, its sessions join the list
-with an `app` column, read through Codex's own `codex app-server` and cached, so they cost
-nothing until Codex has something new. Picking one runs `codex resume` in its folder.
+When the [Codex CLI](https://github.com/openai/codex) or the ChatGPT app has been used, its
+sessions join the list with an `app` column. `s` reads them straight from Codex's own session
+index and files (read-only, cached per thread) and never starts Codex to look. Every `codex`
+process shares, and may refresh, your ChatGPT login, and extra ones racing to refresh it can sign
+the rest out. Picking a session runs `codex resume` in its folder.
 
 Any session can also be continued in the other tool:
 
@@ -126,6 +129,9 @@ Any session can also be continued in the other tool:
   fresh Codex thread on Claude's own summary of the earlier work plus the most recent part.
 - `s 3 --claude` (or `c 3`) writes the Codex conversation out as a transcript and starts
   Claude Code in the same folder, asking it to read the transcript and say where things stand.
+- When the conversation already has a session in the tool you pick (it came from there, or
+  went there before), that session is resumed instead of starting a new one. If you worked in
+  the other tool since, it also gets a transcript of just that part to read first.
 
 A conversation that moved between the tools stays one row, marked `⇄`, with the work of both
 added up. Its number always opens wherever you worked on it last, in that tool, so you never
@@ -135,6 +141,12 @@ imports, and a session that read the other tool's transcript to pick up where it
 
 `s codex` and `s claude` filter the list by tool. Set `SESSIONS_CODEX_ARGS` to pass flags to
 every Codex that `s` starts, for example `export SESSIONS_CODEX_ARGS="-p work"` for a profile.
+
+Codex sometimes refuses to start with `account/read failed ... unauthorized (401)`. That
+happens when its ChatGPT login was refreshed a moment earlier by another Codex process, such as
+the ChatGPT app. A Codex that `s` starts tries once more after a few seconds, and so does
+`codex` in a shell set up by `ai-bridge`. If it still fails, `codex login` signs in again. Use
+the same ChatGPT account in the app and the CLI: they share one login.
 
 ## Shared memory between Claude Code and Codex
 
@@ -208,12 +220,17 @@ Claude Code learns things about you and your projects as you work, and keeps the
 machine you were using. `s sync studio` carries that knowledge, plus your settings, across
 both machines in both directions:
 
-- what Claude remembers about each project, and about you
-- your settings, instructions, key bindings, custom commands, agents, hooks and skills
-- your MCP server list
+- what Claude remembers about each project, and about you (which, with `ai-bridge`, is also
+  what Codex remembers)
+- your Claude Code settings, instructions, key bindings, custom commands, agents, hooks and skills
+- your MCP server list (which `ai-bridge` then gives Codex too)
+- Codex's instructions (`AGENTS.md`), hooks and command rules, and the settings in its
+  `config.toml` and profiles that belong to you rather than to the machine: model, reasoning
+  effort, approvals and permissions, trusted folders and hook approvals. The ChatGPT app's own
+  window preferences, plugin paths and feature flags stay as they are on each machine.
 
-Nothing changes until you have seen the plan and said yes. Newer copies win, settings and
-memory indexes are merged rather than overwritten, something you deleted on one machine is
+Nothing changes until you have seen the plan and said yes. Newer copies win (`--prefer local`
+lets this machine win instead), settings and memory indexes are merged rather than overwritten, something you deleted on one machine is
 removed from the other, and everything replaced is kept in a dated backup folder first.
 Setting up a brand new machine is `s migrate to studio`, which copies everything over and
 deletes nothing.
@@ -265,7 +282,8 @@ address can be a hostname, an IP, or an alias from your ssh config.
 
 **Does resuming change anything?** No. `s` runs the same `claude --resume` or
 `codex resume` you would type yourself, in the session's own folder. Continuing in the other
-tool creates a new session there and leaves the original untouched.
+tool resumes the conversation's own session there if it has one, and otherwise creates a new
+session there; the original is left untouched either way.
 
 **Why `s`?** It is the shortest thing to type when all you want is to get back to work. The
 project is called sessions.
