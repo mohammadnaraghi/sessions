@@ -134,7 +134,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -2469,6 +2469,12 @@ def hosts_setup(label, dest):
                           'else echo "ai-bridge: copied; run ai-bridge setup there to share memory with Codex"; fi',
                     timeout=60)
             print((p.stdout or "") + (p.stderr or ""), end="")
+            p = ssh(dest, f"{REMOTE_S} _plugins", timeout=600)  # plugins the synced settings turn on
+            try:
+                for plugin, outcome in json.loads(p.stdout or "[]"):
+                    print(f"plugin {plugin}: {outcome}")
+            except ValueError:
+                pass
             # MCP servers that sign in there (each machine keeps its own sign-ins)
             p = ssh(dest, 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
                           'grep -q ai-bridge ~/.codex/hooks.json 2>/dev/null && ai-bridge mcp-login --check', timeout=240)
@@ -2850,6 +2856,37 @@ def unpack(data):
     return extra, files
 
 
+def missing_plugins():
+    """Plugins settings.json turns on that Claude Code has not installed on this machine (a sync
+    carries the setting, not the plugin)."""
+    try:
+        with open(os.path.join(CLAUDE_DIR, "settings.json")) as f:
+            enabled = [k for k, v in (json.load(f).get("enabledPlugins") or {}).items() if v]
+    except (OSError, ValueError, AttributeError):
+        return []
+    try:
+        with open(os.path.join(CLAUDE_DIR, "plugins", "installed_plugins.json")) as f:
+            installed = set(json.load(f).get("plugins") or {})
+    except (OSError, ValueError, AttributeError):
+        installed = set()
+    return [p for p in enabled if p not in installed]
+
+
+def install_plugins():
+    """Install the plugins settings.json turns on but this machine lacks. -> [[plugin, outcome]]"""
+    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    out = []
+    for plugin in missing_plugins():
+        try:
+            p = subprocess.run([claude, "plugin", "install", plugin], capture_output=True, text=True,
+                               timeout=300, cwd=HOME)
+            ok = p.returncode == 0
+            out.append([plugin, "installed" if ok else ((p.stderr or p.stdout).strip().splitlines() or ["failed"])[-1][:160]])
+        except (OSError, subprocess.TimeoutExpired) as e:
+            out.append([plugin, f"failed: {e}"])
+    return out
+
+
 def apply_changes(writes, deletes):
     """Write and delete on this machine, keeping a copy of anything replaced under ~/.claude/backups."""
     stamp = datetime.now().strftime("sessions-sync-%Y%m%d-%H%M%S")
@@ -2898,6 +2935,8 @@ def apply_changes(writes, deletes):
             keep(p, logical)
             os.remove(p)
             result["deleted"].append(logical)
+    if "settings.json" in result["written"]:
+        result["plugins"] = install_plugins()
     return result
 
 
@@ -3054,7 +3093,7 @@ def sync_cmd(label, dest, items, prefer, dry, yes, allow_delete, title):
         payload = pack(rw, {"plan.json": json.dumps({"deletes": rd}).encode()})
         try:
             q = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_S} _import"], input=payload,
-                               capture_output=True, timeout=120)
+                               capture_output=True, timeout=600)  # (it may install plugins there)
         except (subprocess.TimeoutExpired, OSError) as e:
             sys.exit(f"{label}: {e}")
         if q.returncode != 0:
@@ -3065,10 +3104,14 @@ def sync_cmd(label, dest, items, prefer, dry, yes, allow_delete, title):
             sys.exit(f"{label}: import gave no result")
         print(f"{label}: wrote {len(rres['written'])}, removed {len(rres['deleted'])}"
               + (f", backups in {rres['backup']}" if rres.get("backup") else ""))
+        for plugin, outcome in rres.get("plugins") or []:
+            print(f"{label}: plugin {plugin}: {outcome}")
+    lres = apply_changes(lw, ld) if lw or ld else {"plugins": install_plugins() if "configs" in items else []}
     if lw or ld:
-        lres = apply_changes(lw, ld)
         print(f"here: wrote {len(lres['written'])}, removed {len(lres['deleted'])}"
               + (f", backups in {lres['backup']}" if lres.get("backup") else ""))
+    for plugin, outcome in lres.get("plugins") or []:
+        print(f"here: plugin {plugin}: {outcome}")
     final = {}
     for logical, e in local.items():
         if logical not in ld:
@@ -3984,6 +4027,9 @@ def main():
         return
     if argv[:1] == ["_import"]:
         import_cmd()
+        return
+    if argv[:1] == ["_plugins"]:  # `s hosts setup` from another machine: plugins its settings turn on
+        print(json.dumps(install_plugins()))
         return
     extra = []
     if "--" in argv:

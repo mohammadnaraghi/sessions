@@ -319,7 +319,8 @@ both machines in both directions:
 
 - what Claude remembers about each project, and about you (which, with `ai-bridge`, is also
   what Codex remembers)
-- your Claude Code settings, instructions, key bindings, custom commands, agents, hooks and skills
+- your Claude Code settings, instructions, key bindings, custom commands, agents, hooks and skills,
+  and the plugins your settings turn on (installed on the other machine when it lacks them)
 - your MCP server list (which `ai-bridge` then gives Codex too)
 - Codex's instructions (`AGENTS.md`), hooks and command rules, and the settings in its
   `config.toml` and profiles that belong to you rather than to the machine: model, reasoning
@@ -332,6 +333,27 @@ something you deleted on one machine is removed from the other, and everything r
 in a dated backup folder first.
 Setting up a brand new machine is `s migrate to studio`, which copies everything over and
 deletes nothing.
+
+### What each machine still needs once
+
+A few things belong to the machine itself and can't be copied. `s hosts setup` tells you
+which of them are missing on the other machine.
+
+- **MCP sign-ins.** Servers that sign in with OAuth need it once per tool on each machine.
+  `ai-bridge mcp-login` signs both tools in to every one that needs it. For the other machine,
+  run `ssh -t studio .local/bin/ai-bridge mcp-login`: no browser opens there, so you open the
+  link it prints here, sign in, and paste back the address you land on. A Mac keeps the
+  sign-ins in its keychain, which is locked over ssh; the command offers to unlock it (with
+  that machine's login password). Until it is unlocked, sessions you start there over ssh
+  can't use those servers either.
+- **Codex's hook approvals.** Codex runs ai-bridge's hooks only after you approve them: it says
+  "Hooks need review" the first time, or use `/hooks`. Approve them on one machine and
+  `s sync` carries the approval to the other.
+- **Chrome.** Claude Code and Codex each drive your own Chrome through an extension: Claude's,
+  and the ChatGPT one that Codex uses. Install them in every Chrome profile you want the agents
+  to use. When the profile is signed in to Chrome Sync, the extensions follow it to your other
+  machine. Each extension still needs signing in once per machine: Claude's in the extension
+  itself, ChatGPT's in the ChatGPT app under Settings → Computer use → Chrome.
 
 ## Cheat sheet
 
@@ -388,6 +410,14 @@ conversation went on without that session, its first message (or, with `ai-bridg
 context) says what happened meanwhile. Continuing in the other tool resumes the conversation's
 own session there if it has one, and otherwise creates a new session there; the original is
 left untouched either way.
+
+**A session works on one machine, but an MCP server fails on the other.** Sign-ins don't
+travel: run `ai-bridge mcp-login` there (see [what each machine still needs
+once](#what-each-machine-still-needs-once)). Over ssh, a Mac's locked keychain hides even the
+sign-ins it has.
+
+**Codex says "Hooks need review".** That is ai-bridge's hooks asking for your approval once.
+Without them, Codex doesn't get Claude's memories or the catch-ups.
 
 **Why `s`?** It is the shortest thing to type when all you want is to get back to work. The
 project is called sessions.
