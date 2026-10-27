@@ -31,6 +31,11 @@ even when it lives on another computer, and in either tool.
 - **Claude Code and Codex in one list.** If you also use the Codex CLI, its sessions show up
   beside your Claude ones, and any session can be continued in the other tool. A conversation
   that moved between the two stays one row and opens wherever you worked on it last.
+- **Every return starts from the whole story.** Go Claude, then Codex, then Claude again: each
+  session you come back to keeps its own history and is told what the others did since it last
+  saw them (where they ended, what they changed, what went wrong), however you open it.
+- **Hand a repository to a new session.** `s handoff` writes one overview of everything done in
+  a repository, in both tools on every machine, with any detail one command away.
 - **One memory for both tools.** The companion `ai-bridge` shares memories and MCP servers
   between Claude Code and Codex, with nothing to run once it is set up.
 - **See what is running.** `s live` shows each open session: busy or idle, what you asked,
@@ -86,6 +91,10 @@ schedule, how many of its possible runs have happened, and a plain status: live,
 done, expired, cancelled, or dead because the terminal closed.
 
 ## Hand a repository to a new session
+
+<p align="center">
+  <img src="docs/handoff.svg" width="100%" alt="s handoff: one overview of everything done in a repository">
+</p>
 
 `s handoff` (in a repository, or `s handoff ~/code/api`) writes one document for a new session
 about everything done there, in Claude Code and Codex, on every machine:
@@ -153,8 +162,8 @@ searches, at Anthropic's and OpenAI's published per-model prices (the date is pr
 result). A session's subagents and workflow agents count toward it (in Codex too: its subagent
 and reviewer threads count toward the thread they worked for), and a conversation that moved
 between the tools counts once. Checked against the cost snapshots Claude Code keeps in its
-transcripts, they match to the cent for most sessions; the calls Claude Code makes for itself, such as titles and compaction, are not in its
-transcripts, so Claude totals can read slightly low.
+transcripts, they match to the cent for most sessions; the calls Claude Code makes for itself,
+such as titles and compaction, are not in its transcripts, so Claude totals can read slightly low.
 
 ## Claude Code and Codex
 
@@ -235,6 +244,24 @@ From then on there is nothing to run. You start `claude` or `codex` as usual, an
 | `ai-bridge sync` | copy Claude's MCP servers into Codex now |
 | `ai-bridge update` | the latest release (`s update` does this too) |
 
+### Which memory is which
+
+Five things get called memory, and only some of them reach your coding sessions:
+
+| Where | What it is | Who reads it |
+|---|---|---|
+| `~/.claude/CLAUDE.md`, a project's `CLAUDE.md` | instructions you write | Claude Code always; Codex too with `ai-bridge` |
+| `~/.claude/projects/<project>/memory/` | what Claude learns as it works, per project (an index plus one file per memory) | Claude Code; Codex too with `ai-bridge`, which also brings back what Codex learns |
+| `~/.codex/AGENTS.md`, a project's `AGENTS.md` | instructions for Codex | Codex |
+| Codex's own memories (`memories = true` under `[features]`) | a separate store Codex writes in the background | Codex only |
+| Your ChatGPT and claude.ai account memory | what the chat apps remember about you | the ChatGPT and Claude chat apps, not Codex or Claude Code |
+
+With `ai-bridge`, keep one store: Claude Code's memory, which both tools read and write and
+`s sync` keeps the same on your machines. Leave Codex's own memories off, or they become a second
+store Claude never sees. Put rules that must always hold in `CLAUDE.md` or `AGENTS.md`, not in
+memory. Account memory only affects the chat apps, so turn it on or off for them alone; if you
+have more than one ChatGPT account, each keeps its own.
+
 Setup links those commands next to `ai-bridge` and edits, after backing each one up as
 `*.bak-ai-bridge-<time>`: a SessionStart hook in `~/.claude/settings.json`, a SessionStart hook
 in `~/.codex/hooks.json` (Codex asks you to trust it the first time), a marked block in
@@ -285,8 +312,9 @@ both machines in both directions:
   window preferences, plugin paths and feature flags stay as they are on each machine.
 
 Nothing changes until you have seen the plan and said yes. Newer copies win (`--prefer local`
-lets this machine win instead), settings and memory indexes are merged rather than overwritten, something you deleted on one machine is
-removed from the other, and everything replaced is kept in a dated backup folder first.
+lets this machine win instead), settings and memory indexes are merged rather than overwritten,
+something you deleted on one machine is removed from the other, and everything replaced is kept
+in a dated backup folder first.
 Setting up a brand new machine is `s migrate to studio`, which copies everything over and
 deletes nothing.
 
@@ -339,10 +367,12 @@ connection is kept open for a few minutes so the next run skips the handshake.
 **Can I name my machines whatever I want?** Yes. The name is just a label you type; the ssh
 address can be a hostname, an IP, or an alias from your ssh config.
 
-**Does resuming change anything?** No. `s` runs the same `claude --resume` or
-`codex resume` you would type yourself, in the session's own folder. Continuing in the other
-tool resumes the conversation's own session there if it has one, and otherwise creates a new
-session there; the original is left untouched either way.
+**Does resuming change anything?** It runs the same `claude --resume` or `codex resume` you
+would type yourself, in the session's own folder. The only addition: when the rest of the
+conversation went on without that session, its first message (or, with `ai-bridge`, its start
+context) says what happened meanwhile. Continuing in the other tool resumes the conversation's
+own session there if it has one, and otherwise creates a new session there; the original is
+left untouched either way.
 
 **Why `s`?** It is the shortest thing to type when all you want is to get back to work. The
 project is called sessions.

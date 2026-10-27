@@ -134,7 +134,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -1845,7 +1845,11 @@ def worktrees(root):
 
 
 def under(path, roots):
-    return bool(path) and any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+    """Is path one of roots or inside one (as written, or with symlinks resolved, /tmp being /private/tmp)?"""
+    if not path:
+        return False
+    paths = {path, os.path.realpath(path)}
+    return any(p == r or p.startswith(r.rstrip("/") + "/") for p in paths for r in roots)
 
 
 def repo_handoff(root, sessions, detailed=10):
@@ -1853,7 +1857,7 @@ def repo_handoff(root, sessions, detailed=10):
     every conversation about it in either tool on every machine (what it set out to do, where
     it ended, what it changed, what went wrong), the latest one in detail, what Claude remembers
     about the project, and the commands that pull any detail on demand. -> (path, rows)"""
-    roots = [root] + worktrees(root)
+    roots = list(dict.fromkeys([root, os.path.realpath(root)] + worktrees(root)))
     mine = [s for s in sessions if under(s.get("cwd"), roots)]
     rows = sorted(merge_rows(mine), key=lambda r: r["last"], reverse=True)
     by_key = {(s.get("host"), s["id"]): s for s in mine}

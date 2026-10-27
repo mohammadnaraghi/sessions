@@ -475,13 +475,17 @@ def main():
 
         home_re = re.escape(home_local)
 
+        cache_re = re.escape(os.path.join(tmp, "local-cache"))
+
         def tidy(text):
-            return re.sub(home_re, "~", text)
+            return re.sub(home_re, "~", re.sub(cache_re, "~/.cache/sessions", text))
 
         os.makedirs(OUT, exist_ok=True)
         svg(tidy(capture(tool, [], cols=124, lines=22, picker=True)), "s", os.path.join(OUT, "picker.svg"), cols=124)
         svg(tidy(capture(tool, ["search", "test"], cols=124, lines=16, picker=True)), "s search test",
             os.path.join(OUT, "search.svg"), cols=124)
+        svg(tidy(capture(tool, ["handoff", os.path.join(home_local, "code", "api")], cols=124)), "s handoff ~/code/api",
+            os.path.join(OUT, "handoff.svg"), cols=124)
         svg(tidy(capture(tool, ["live"])), "s live", os.path.join(OUT, "live.svg"))
         svg(tidy(capture(tool, ["show", "a1b2c3d4-0000-4000-8000-000000000002"])), "s show 2", os.path.join(OUT, "show.svg"))
         svg(tidy(capture(tool, ["jobs"])), "s jobs", os.path.join(OUT, "jobs.svg"))
