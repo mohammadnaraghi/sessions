@@ -85,6 +85,27 @@ after a week. That is easy to forget. `s jobs` lists every job you ever set up w
 schedule, how many of its possible runs have happened, and a plain status: live, waiting,
 done, expired, cancelled, or dead because the terminal closed.
 
+## Hand a repository to a new session
+
+`s handoff` (in a repository, or `s handoff ~/code/api`) writes one document for a new session
+about everything done there, in Claude Code and Codex, on every machine:
+
+- the repository now: branch, uncommitted work, latest commits, recent branches, worktrees and
+  open pull requests
+- what Claude remembers about the project
+- every conversation about it, latest first: what it set out to do, what you last asked, where it
+  ended, the files it changed, the last problem it hit, an unfinished checklist
+- the latest conversation in more detail
+- how to read any detail on demand
+
+It is an overview on purpose: big enough to know what happened and where things stand, small
+enough to read at once. A detail is one command away, `s transcript <session id>`: a session as a
+document (where it ended, files it changed, problems it hit, the latest part of the
+conversation), with `--all` for all of it, `--grep WORDS` for the parts about something and
+`--since 2d` for the recent part, for sessions on any machine in either tool. `s handoff
+--claude` (or `--codex`) starts the new session with it and asks it to say what the repository
+is, where it stands and what looks unfinished or fragile.
+
 ## Find anything you ever asked
 
 <p align="center">
@@ -154,8 +175,10 @@ Any session can also be continued in the other tool:
 - When the conversation already has a session in the tool you pick (it came from there, or
   went there before), that session is resumed instead of starting a new one. It keeps its own
   full history, and gets just what the rest of the conversation did since it last saw it: from
-  every other session of it, in either tool, oldest first. A short catch-up is in its first
-  message; a long one is a file it reads.
+  every other session of it, in either tool, oldest first. For each one: where it ended, the
+  files it changed, the problems it hit, Claude's own summary of any part left out, and the
+  conversation; then the working tree now and the commits since. A short catch-up is in its
+  first message; a long one is a file it reads, and `s transcript` pulls any part in full.
 
 With `ai-bridge` set up, the same catch-up happens however you open a session: `claude
 --resume`, `codex resume`, or the ChatGPT app. As a session resumes, its start hook asks `s`
@@ -277,6 +300,8 @@ deletes nothing.
 | `s 1a2b3c4d` | open exactly that session (by id), even one step of a `⇄` chain |
 | `s tiktok` | filter by any word; resumes at once if only one matches |
 | `s search stripe paywall` | every prompt you ever wrote with those words, on every machine |
+| `s handoff` · `s handoff --claude` | a handoff of everything done in this repository · and start a new session with it |
+| `s transcript 1a2b3c4d --grep auth` | read any session (or the parts about something) on demand |
 | `s running` · `s cron` · `s @studio` | only running sessions, only sessions with jobs, only one machine |
 | `s codex` · `s claude` | only Codex sessions · only Claude Code sessions |
 | `s cost` | spend at API list prices per day, week and month, by model and session |

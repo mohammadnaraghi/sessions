@@ -60,7 +60,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/ai-bridge"
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -392,6 +392,10 @@ def render_claude(path):
 def cmd_claude_transcript(args):
     cwd = Path.cwd().resolve()
     path = find_claude_session(args[0] if args else None, cwd)
+    text = s_transcript(path.stem)  # the richer document, when s is beside this script
+    if text is not None:
+        sys.stdout.write(text)
+        return 0
     title, _ = claude_title(path)
     blocks, more = render_claude(path)
     header = ["# Claude Code session", "",
@@ -657,8 +661,26 @@ def codex_transcript(cwd, thread_id=None):
     return text, thread, work
 
 
+def s_transcript(sid):
+    """`s transcript <id>` (where it ended, files changed, problems, the conversation, the working
+    tree) when the sessions picker is installed beside this script, else None."""
+    s = SCRIPT.parent / "s"
+    if not s.is_file():
+        return None
+    try:
+        p = subprocess.run([sys.executable, str(s), "transcript", sid, "--local", "-d", "365"],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 and p.stdout.strip() else None
+
+
 def cmd_codex_transcript(args):
-    text, _, _ = codex_transcript(Path.cwd().resolve(), args[0] if args else None)
+    cwd = Path.cwd().resolve()
+    thread = find_codex_thread(cwd, args[0] if args else None)
+    text = s_transcript(thread["id"]) if thread else None
+    if text is None:
+        text, _, _ = codex_transcript(cwd, args[0] if args else None)
     sys.stdout.write(text)
     return 0
 

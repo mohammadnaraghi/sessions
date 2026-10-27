@@ -28,6 +28,16 @@ Usage
                          machine, however old: the conversations with a prompt
                          that has all the words, newest match first, to pick from
   s show 3 | show <id>   details: work per day, prompts, live status, cron jobs
+  s transcript 3 | <id>  a session as a document: where it ended, the files it
+                         changed, problems it hit, the latest part of the
+                         conversation (--all: all of it; --grep WORDS: only the
+                         parts about them; --since 2d). Any machine, either tool.
+  s handoff [DIR]        a handoff for a new session about everything done in a
+                         repository: its state (branches, uncommitted work, PRs),
+                         every conversation about it (goal, where it ended, files,
+                         problems), the latest one in detail, Claude's memories,
+                         and how to read any detail (-d 90 by default).
+                         --claude / --codex start that new session with it.
   s cost                 what your sessions would cost at API list prices (not a
                          subscription): bar charts per day, week and month,
                          Claude Code vs Codex, by model, and the top sessions
@@ -124,7 +134,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -137,7 +147,7 @@ PROJECTS = os.path.join(CLAUDE_DIR, "projects")
 CONFIG_DIR = env("CONFIG_DIR") or os.path.expanduser("~/.config/sessions")
 CACHE_DIR = env("CACHE_DIR") or os.path.expanduser("~/.cache/sessions")
 CACHE = os.path.join(CACHE_DIR, "cache.json")
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 HOSTS_FILE = os.path.join(CONFIG_DIR, "hosts")
 HOME = env("HOME") or os.path.expanduser("~")  # override for tests
 HOME_RE = re.compile(r"^/(?:Users|home)/[^/]+")
@@ -145,9 +155,9 @@ GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
-CODEX_CACHE_VERSION = 6
+CODEX_CACHE_VERSION = 8
 HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # transcripts handed from one tool to the other
-HANDOFF_MAX = 60_000
+HANDOFF_MAX = 80_000  # characters of a session's conversation in a handoff (about 20k tokens)
 # Codex models read about 272k tokens. A Claude conversation bigger than this is not imported
 # whole (Codex could not even compact it); Codex gets Claude's summary plus the recent part.
 IMPORT_MAX_TOKENS = 150_000
@@ -168,9 +178,10 @@ UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # How one tool's session points at the other's: a Codex transcript handed to Claude (by s or by
 # ai-bridge), or a command that reads the other tool's session ("continue where Codex left off").
 HANDOFF_RE = re.compile(r"handoffs/(?:\d{8}-\d{4}-)?(" + UUID + r")\.md")
-# (ai-bridge's reader itself, not any command that mentions it)
-READS_CODEX_RE = re.compile(r"ai-bridge['\"]?\s+codex-transcript\s+(" + UUID + ")")
-READS_CLAUDE_RE = re.compile(r"ai-bridge['\"]?\s+claude-transcript\s+(" + UUID + ")")
+# (ai-bridge's reader run as the command, the way its hooks tell an agent to: not a command that
+# merely mentions it, nor one that runs a copy of it some other way)
+READS_CODEX_RE = re.compile(r"(?:^|&&|;|\|)\s*['\"]?[^\s'\";&|]*ai-bridge['\"]?\s+codex-transcript\s+(" + UUID + ")")
+READS_CLAUDE_RE = re.compile(r"(?:^|&&|;|\|)\s*['\"]?[^\s'\";&|]*ai-bridge['\"]?\s+claude-transcript\s+(" + UUID + ")")
 PASTE_RE = re.compile(r"</?pasted_content[^>]*>")
 REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 WS_RE = re.compile(r"\s+")
@@ -800,7 +811,35 @@ def codex_text(content):
     return "\n".join(x.get("text") or "" for x in content or [] if isinstance(x, dict) and "text" in x)
 
 
+EXEC_CMD_RE = re.compile(r'exec_command\(\s*\{\s*"?cmd"?\s*:\s*"((?:[^"\\]|\\.)*)"')
+PATCH_FILE_RE = re.compile(r"\*\*\* (?:Add|Update|Delete) File: ([^\n\\\"]+)")
+
+
+def call_commands(item):
+    """The shell commands inside a raw Codex tool call: in code mode Codex runs them from a script
+    (tools.exec_command({cmd: "..."})), else they are the call's own arguments."""
+    body, cmds = item.get("command") or "", []
+    for m in EXEC_CMD_RE.finditer(body):
+        try:
+            cmds.append(json.loads('"' + m.group(1) + '"'))
+        except ValueError:
+            cmds.append(m.group(1))
+    if not cmds and body.lstrip().startswith("{"):
+        try:
+            args = json.loads(body)
+        except ValueError:
+            args = {}
+        cmd = args.get("cmd") or args.get("command") if isinstance(args, dict) else None
+        if isinstance(cmd, list):
+            cmd = cmd[-1] if len(cmd) == 3 and cmd[1] in ("-c", "-lc") else shlex.join(map(str, cmd))
+        if isinstance(cmd, str):
+            cmds.append(cmd)
+    return cmds
+
+
 def codex_command(item):
+    if item.get("type") == "Call":
+        return " ; ".join(call_commands(item))
     cmd = item.get("command")
     if isinstance(cmd, list):  # ["/bin/zsh", "-lc", "the command"]
         cmd = cmd[-1] if len(cmd) == 3 and cmd[1] in ("-c", "-lc") else shlex.join(map(str, cmd))
@@ -1079,48 +1118,255 @@ def codex_lines(kind, v):
     if t in ("WebSearch", "Extension") and v.get("query"):
         return ["- searched the web: " + v["query"]]
     if t == "Call":
-        return [f"- used {v.get('name')}"]
+        cmds = call_commands(v)
+        if cmds:
+            return [f"- ran `{WS_RE.sub(' ', cmd)[:300]}`" for cmd in cmds[:5]]
+        files = PATCH_FILE_RE.findall(v.get("command") or "")
+        return ["- changed " + ", ".join(dict.fromkeys(files))] if files else [f"- used {v.get('name')}"]
     return []
 
 
-def handoff_file(sid, since):
+# ----------------------------------------------------------------- sessions as documents
+#
+# Every handoff, catch-up and `s transcript` is built from one reading of a session as items,
+# (unix time, kind, markdown), alike for both tools. Kinds: user, agent (a reply, or a subagent's
+# report), tool (one line per call), error (a failed call with what it said), files (a path it
+# changed), summary (Claude's own summary of the earlier part, written when it compacted).
+
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+SUBAGENT_TOOLS = ("Agent", "Task")
+REPORT_MAX = 1500  # a subagent's report or a failure is kept to this many characters
+
+
+def body_text(body):
+    if isinstance(body, str):
+        return body
+    return "\n".join(x.get("text", "") for x in body or [] if isinstance(x, dict) and x.get("type") == "text")
+
+
+def claude_items(path, since=None):
+    """A Claude transcript as items, only those after `since` (unix time) if given."""
+    items, calls = [], {}
+    try:
+        f = open(path, errors="ignore")
+    except OSError:
+        return items
+    with f:
+        for line in f:
+            if '"user"' not in line and '"assistant"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            kind = o.get("type")
+            if kind not in ("user", "assistant") or o.get("isSidechain"):
+                continue
+            ts = parse_ts(o.get("timestamp"))
+            t = ts.timestamp() if ts else 0
+            content = (o.get("message") or {}).get("content")
+            blocks = content if isinstance(content, list) else []
+            keep = since is None or t > since
+            if kind == "assistant":
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        nm, inp = b.get("name"), b.get("input") or {}
+                        calls[b.get("id")] = (nm, inp)
+                        if keep:
+                            items.append((t, "tool", f"- {nm}: {tool_summary(nm, inp)}"))
+                            if nm in EDIT_TOOLS and (inp.get("file_path") or inp.get("notebook_path")):
+                                items.append((t, "files", inp.get("file_path") or inp.get("notebook_path")))
+                    elif b.get("type") == "text" and (b.get("text") or "").strip() and keep:
+                        items.append((t, "agent", "**Claude:** " + b["text"].strip()))
+                continue
+            if not keep:
+                continue
+            if o.get("isCompactSummary"):
+                items.append((t, "summary", claude_text_of(content).strip()))
+                continue
+            for b in blocks:
+                if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                    continue
+                nm, inp = calls.get(b.get("tool_use_id"), ("tool", {}))
+                text = WS_RE.sub(" ", body_text(b.get("content"))).strip()
+                if b.get("is_error"):
+                    items.append((t, "error", f"- {nm} ({tool_summary(nm, inp)[:120]}) failed: {text[:600]}"))
+                elif nm in SUBAGENT_TOOLS and text:
+                    items.append((t, "agent", f"**Subagent ({inp.get('description') or nm}):** {text[:REPORT_MAX]}"))
+            if o.get("isMeta"):
+                continue
+            txt = prompt_text(content)
+            if txt:
+                items.append((t, "user", "**You:** " + txt))
+    return items
+
+
+def codex_items(rollout, since=None):
+    """A Codex session file as items, only those after `since` (unix time) if given."""
+    items = []
+    for kind, t, v in codex_events(read_rollout(rollout) or ""):
+        if since is not None and (t or 0) <= since:
+            continue
+        if kind in ("user", "agent") and (v or "").strip():
+            items.append((t or 0, kind, ("**You:** " if kind == "user" else "**Codex:** ") + v.strip()))
+        elif kind == "tool":
+            items += [(t or 0, "tool", ln) for ln in codex_lines(kind, v)]
+            if v.get("type") == "FileChange":
+                ch = v.get("changes") or {}
+                paths = list(ch) if isinstance(ch, dict) else [x.get("path") for x in ch if isinstance(x, dict)]
+                items += [(t or 0, "files", p) for p in paths if p]
+            elif v.get("type") == "Call":
+                items += [(t or 0, "files", p.strip()) for p in dict.fromkeys(PATCH_FILE_RE.findall(v.get("command") or ""))]
+            code = v.get("exit_code")
+            if v.get("type") == "CommandExecution" and code not in (0, None):
+                out = WS_RE.sub(" ", v.get("aggregated_output") or "").strip()[-600:]  # the error is at the end
+                items.append((t or 0, "error", f"- `{WS_RE.sub(' ', codex_command(v))[:200]}` failed (exit {code}): {out}"))
+    return items
+
+
+def session_items(s, since=None):
+    if is_remote(s):
+        return []
+    if app_of(s) == "codex":
+        return codex_items(s.get("rollout"), since)
+    return claude_items(s["path"], since) if s.get("path") else []
+
+
+def render_items(items, budget=None):
+    """The conversation part of items as markdown, the newest that fit in `budget` characters.
+    -> (text, how many items were left out)"""
+    talk = [(t, k, x) for t, k, x in items if k in ("user", "agent", "tool", "error")]
+    kept, size = [], 0
+    for item in reversed(talk):
+        if budget is not None and kept and size + len(item[2]) > budget:
+            break
+        kept.append(item)
+        size += len(item[2]) + 2
+    kept.reverse()
+    out = []
+    for _, kind, text in kept:
+        if out and kind in ("tool", "error") and out[-1][0] in ("tool", "error"):
+            out[-1] = (kind, out[-1][1] + "\n" + text)  # calls in a row stay one block
+        else:
+            out.append((kind, text))
+    return "\n\n".join(text for _, text in out), len(talk) - len(kept)
+
+
+def session_doc(s, items, budget=None, heading=None, since=None):
+    """One session as a document: who and where, where it ended, the files it changed, the
+    problems it hit, Claude's summary of whatever is left out, and the conversation itself."""
+    tool = APP_LABEL[app_of(s)]
+    where = f"`{s['id']}`, {tool}" + (f", on {s['host']}" if is_remote(s) else "")
+    head = [f"## {heading or name(s)}", f"- Session: {where}",
+            f"- Folder: {s.get('cwd') or '?'}" + (f" (branch {s['branch']})" if s.get("branch") else ""),
+            f"- Active: {when(s['first'])} to {when(s['last'])}, {hm((s.get('active') or 0) / 60)} of work"
+            + (f", model {s['model']}" if s.get("model") else "")]
+    parts = ["\n".join(head)]
+    ends = [x for x in items if x[1] == "agent" and not x[2].startswith("**Subagent")]
+    asks = [x for x in items if x[1] == "user"]
+    if ends:
+        last = ends[-1][2]
+        if len(last) > 6000:
+            last = last[:6000] + " …"
+        parts.append("### Where it ended\n\n" + (asks[-1][2] + "\n\n" if asks else "") + last)
+    files = list(dict.fromkeys(reversed([x[2] for x in items if x[1] == "files"])))
+    if files:  # its own folder's first, as paths relative to it
+        home = (s.get("cwd") or "").rstrip("/") + "/"
+        files = ([p[len(home):] for p in files if p.startswith(home)] + [p for p in files if not p.startswith(home)])
+        parts.append("### Files it changed (latest first)\n\n" + "\n".join(f"- {p}" for p in files[:40])
+                     + (f"\n- … and {len(files) - 40} more" if len(files) > 40 else ""))
+    errors = [x[2] for x in items if x[1] == "error"]
+    if errors:
+        parts.append("### Problems it hit (the latest)\n\n" + "\n".join(errors[-5:]))
+    text, left_out = render_items(items, budget)
+    summaries = [x for x in items if x[1] == "summary"]
+    if left_out and summaries:
+        parts.append("### Earlier, in Claude's own summary\n\n" + fit_block(summaries[-1][2], 20000))
+    more = (f"s transcript {s['id']}" + (f" --since '{iso(since)}'" if since else "")
+            + (f" (on {s['host']})" if is_remote(s) else ""))
+    parts.append("### The conversation" + (f" (the latest part; {left_out} earlier entries: `{more} --all`)"
+                                           if left_out else "") + "\n\n" + (text or "(nothing said)"))
+    return "\n\n".join(parts)
+
+
+def fit_block(text, n):
+    return text if len(text) <= n else text[:n] + "\n\n…(cut)"
+
+
+def git_out(cwd, *args, timeout=5):
+    try:
+        p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout.rstrip() if p.returncode == 0 else None
+
+
+def git_state(cwd, since=None):
+    """The repository a session worked in, as it is now: branch, what is not committed, and the
+    commits (since `since`, else the latest). None outside a git repository."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    root = git_out(cwd, "rev-parse", "--show-toplevel")
+    if not root:
+        return None
+    branch = git_out(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "?"
+    lines = [f"- Repository {root}, branch {branch}"]
+    counts = git_out(cwd, "rev-list", "--left-right", "--count", "@{upstream}...HEAD")
+    if counts and len(counts.split()) == 2:
+        behind, ahead = counts.split()
+        if behind != "0" or ahead != "0":
+            lines[0] += f" ({ahead} commits ahead of its upstream, {behind} behind)"
+    status = (git_out(cwd, "status", "--short") or "").splitlines()
+    if status:
+        stat = git_out(cwd, "diff", "--shortstat", "HEAD") or ""
+        lines.append(f"- Not committed: {len(status)} files" + (f" ({stat.strip()})" if stat else "") + "\n"
+                     + "\n".join("    " + x for x in status[:30]) + ("\n    …" if len(status) > 30 else ""))
+    else:
+        lines.append("- Everything is committed")
+    args = ["log", "--format=%h %ad %s", "--date=format:%b %d %H:%M", "-n", "20"]
+    if since:
+        args.append("--since=" + datetime.fromtimestamp(since).isoformat())
+    log = git_out(cwd, *args)
+    if log:
+        lines.append(("- Commits since then:\n" if since else "- Latest commits:\n")
+                     + "\n".join("    " + x for x in log.splitlines()))
+    elif since:
+        lines.append("- No commits since then")
+    stashes = git_out(cwd, "stash", "list")
+    if stashes:
+        lines.append(f"- {len(stashes.splitlines())} stashed change sets (git stash list)")
+    return "\n".join(lines)
+
+
+def handoff_file(stem):
     os.makedirs(HANDOFF_DIR, exist_ok=True)
-    stem = sid if since is None else f"{datetime.now():%Y%m%d-%H%M}-{sid}"  # a catch-up keeps the earlier file
     return os.path.join(HANDOFF_DIR, stem + ".md")
 
 
-def codex_turns(s, since=None):
-    """[(unix time, markdown)], one per turn of a Codex thread, only those after `since` if given."""
-    turns = []
-    for kind, t, v in codex_events(read_rollout(s.get("rollout")) or ""):
-        if kind == "start" or not turns:
-            turns.append([t, []])
-        turns[-1][1] += codex_lines(kind, v)
-    return [(t or 0, "\n\n".join(lines)) for t, lines in turns if lines and (since is None or (t or 0) > since)]
-
-
-def codex_handoff(s, since=None):
-    """Write a Codex thread's transcript for Claude to read: its most recent part, or only the turns
-    after `since` (unix time). -> path, or None when nothing happened after `since`."""
-    texts = [text for _, text in codex_turns(s, since)]
-    if since is not None and not texts:
-        return None
-    kept, size = [], 0
-    for text in reversed(texts):
-        if kept and size + len(text) > HANDOFF_MAX:
-            break
-        kept.append(text)
-        size += len(text)
-    kept.reverse()
-    head = [f"# Codex session: {name(s)}", "", f"- Thread: `{s['id']}`", f"- Folder: {s.get('cwd') or '?'}",
-            f"- Model: {s.get('model') or '?'}", f"- Last active: {when(s['last'])}"]
-    if since is not None:
-        head.append(f"- Only what happened since {when(iso(since))}")
-    if len(kept) < len(texts):
-        head.append(f"- Earlier turns are left out; the whole thread: `codex resume {s['id']}`")
-    path = handoff_file(s["id"], since)
+def codex_handoff(s):
+    """Write a Codex thread for Claude to read. -> path"""
+    doc = ["# Handoff from Codex", session_doc(s, codex_items(s.get("rollout")), HANDOFF_MAX)]
+    state = git_state(s.get("cwd"))
+    if state:
+        doc.append("## The working tree now\n\n" + state)
+    path = handoff_file(s["id"])
     with open(path, "w") as f:
-        f.write("\n".join(head) + "\n\n---\n\n" + "\n\n---\n\n".join(kept) + "\n")
+        f.write("\n\n".join(doc) + "\n")
+    return path
+
+
+def claude_handoff(s):
+    """Write a Claude conversation too long to import for Codex to read: where it ended, what it
+    changed, Claude's own summary of the earlier work and as much of the latest part as fits. -> path"""
+    doc = ["# Handoff from Claude Code", session_doc(s, claude_items(s["path"]), HANDOFF_MAX)]
+    state = git_state(s.get("cwd"))
+    if state:
+        doc.append("## The working tree now\n\n" + state)
+    path = handoff_file(s["id"])
+    with open(path, "w") as f:
+        f.write("\n\n".join(doc) + "\n")
     return path
 
 
@@ -1172,51 +1418,40 @@ def last_turn(s):
 
 
 def catchup(target, write=True):
-    """What the rest of target's conversation did that target has not seen, in every other session
-    of it in either tool, oldest first: {"text", "path", "tools", "inline", "through"} or None. Not
-    seen: since it was last caught up, else since its own last turn."""
+    """What the rest of target's conversation did that target has not seen: every other session
+    of it in either tool, each as a document (where it ended, what it changed, what went wrong,
+    the conversation), oldest first, then the working tree now with the commits since.
+    -> {"text", "path", "tools", "inline", "through"} or None. Not seen: since target was last
+    caught up, else since its own last turn."""
     through = time.time()
-    since, items, sources = caught_up(target["id"]) or last_turn(target), [], {}
+    since = caught_up(target["id"]) or last_turn(target)
+    sources = []
     for ref in target.get("chain") or []:
         m = SESSION_INDEX.get((target.get("host"), ref["id"]))
         if not m or m["id"] == target["id"] or parse_ts(m["last"]).timestamp() <= since + 1:
             continue
-        if app_of(m) == "codex":
-            turns = codex_turns(m, since)
-        else:
-            turns = [e for e in read_claude(m["path"])[2] if (e[0] or 0) > since]
-        if turns:
-            sources[m["id"]] = m
-            items += [(t or 0, m["id"], text) for t, text in turns]
-    if not items:
+        items = session_items(m, since)
+        if any(k in ("user", "agent") for _, k, _ in items):
+            sources.append((min(t for t, _, _ in items), m, items))
+    if not sources:
         return None
-    items.sort(key=lambda x: x[0])
-    kept, size = [], 0
-    for item in reversed(items):
-        if kept and size + len(item[2]) > HANDOFF_MAX:
-            break
-        kept.append(item)
-        size += len(item[2])
-    kept.reverse()
-    out, current = [f"# This conversation since {when(iso(since))}"], None
-    if len(kept) < len(items):
-        out.append("(the earliest part is left out)")
-    for _, sid, text in kept:
-        if sid != current:
-            m = sources[sid]
-            out.append(f"## In {APP_LABEL[app_of(m)]}: \"{name(m)}\" (`{sid}`)")
-            current = sid
-        out.append(text)
+    sources.sort(key=lambda x: x[0])
+    budget = max(15000, HANDOFF_MAX // len(sources))
+    out = [f"# This conversation since {when(iso(since))}"]
+    for _, m, items in sources:
+        out.append(session_doc(m, items, budget, f"In {APP_LABEL[app_of(m)]}: {name(m)}", since))
+    state = git_state(target.get("cwd"), since)
+    if state:
+        out.append("## The working tree now\n\n" + state)
     text = "\n\n".join(out) + "\n"
-    latest = max(sources.values(), key=lambda m: m["last"])
-    path = os.path.join(HANDOFF_DIR, f"{datetime.now():%Y%m%d-%H%M}-{latest['id']}.md")  # names a session it came from
+    latest = max((m for _, m, _ in sources), key=lambda m: m["last"])
+    path = handoff_file(f"{datetime.now():%Y%m%d-%H%M}-{latest['id']}")  # named after a session it came from
     if write:
-        os.makedirs(HANDOFF_DIR, exist_ok=True)
         with open(path, "w") as f:
             f.write(text)
     tools = []
-    for m in sorted(sources.values(), key=lambda m: m["last"]):
-        label = ("another Claude Code session" if app_of(m) == app_of(target)
+    for _, m, _ in sources:
+        label = (f"another {APP_LABEL[app_of(m)]} session" if app_of(m) == app_of(target)
                  else "Codex (GPT)" if app_of(m) == "codex" else "Claude Code")
         if label not in tools:
             tools.append(label)
@@ -1292,37 +1527,6 @@ def claude_text_of(content):
     if isinstance(content, str):
         return content
     return "\n".join(b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
-
-
-def claude_handoff(s, summary, entries, since=None):
-    """Write a Claude conversation for Codex to read: Claude's summary of the earlier work plus
-    the most recent part, or only what happened after `since` (unix time). -> path, or None when
-    nothing happened after `since`."""
-    if since is not None:
-        entries, summary = [e for e in entries if (e[0] or 0) > since], None
-        if not entries:
-            return None
-    kept, size = [], 0
-    for _, entry in reversed(entries):
-        if kept and size + len(entry) > HANDOFF_MAX:
-            break
-        kept.append(entry)
-        size += len(entry)
-    kept.reverse()
-    head = [f"# Claude Code session: {name(s)}", "", f"- Session: `{s['id']}`",
-            f"- Folder: {s.get('cwd') or '?'}", f"- Last active: {when(s['last'])}",
-            f"- The whole transcript: {s['path']}"]
-    if since is not None:
-        head.append(f"- Only what happened since {when(iso(since))}")
-    parts = ["\n".join(head)]
-    if summary:
-        parts.append("## Claude's summary of the earlier work\n\n" + summary.strip())
-    parts.append(("## What happened" if since is not None else "## The most recent part")
-                 + (" (earlier turns left out)" if len(kept) < len(entries) else "") + "\n\n" + "\n\n".join(kept))
-    path = handoff_file(s["id"], since)
-    with open(path, "w") as f:
-        f.write("\n\n---\n\n".join(parts) + "\n")
-    return path
 
 
 def codex_args():
@@ -1588,6 +1792,176 @@ def highlight(text, words):
         return text
     return re.sub("|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)),
                   lambda m: c("1;33", m.group(0)), text, flags=re.I)
+
+
+# ----------------------------------------------------------------- details on demand, repo handoffs
+
+def parse_when(text):
+    """'2026-10-27 14:30', an ISO time, or how long ago ('3h', '2d') -> unix time."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([mhd])", text.strip())
+    if m:
+        return time.time() - float(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    ts = parse_ts(text.strip().replace(" ", "T"))
+    if ts is None:
+        sys.exit(f"cannot read the time '{text}' (try 2026-10-27 14:30, or 3h / 2d ago)")
+    if ts.tzinfo is None:
+        ts = ts.astimezone()
+    return ts.timestamp()
+
+
+def grep_items(items, words):
+    """The entries that have every word, each with the entry before and after it."""
+    talk = [x for x in items if x[1] in ("user", "agent", "tool", "error")]
+    hit = {i for i, x in enumerate(talk) if all(w in x[2].lower() for w in words)}
+    keep = {j for i in hit for j in (i - 1, i, i + 1) if 0 <= j < len(talk)}
+    return [x for i, x in enumerate(talk) if i in keep]
+
+
+def transcript_cmd(s, a, words):
+    """`s transcript`: one session as a document, to read any part of it on demand."""
+    if is_remote(s):
+        args = ["transcript", s["id"], "--local"] + (["--all"] if a.all else [])
+        args += (["--grep", a.grep] if a.grep else []) + (["--since", a.since] if a.since else [])
+        dest = HOSTS.get(s["host"], s["host"])
+        sys.exit(subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_S} {shlex.join(args)}"]).returncode)
+    since = parse_when(a.since) if a.since else None
+    items = session_items(s, since)
+    if words:
+        items = grep_items(items, words)
+    print(session_doc(s, items, None if a.all or words else HANDOFF_MAX, since=since))
+    state = git_state(s.get("cwd"))
+    if state and not words:
+        print("\n## The working tree now\n\n" + state)
+
+
+def repo_root(path):
+    path = os.path.realpath(os.path.expanduser(path))
+    return git_out(path, "rev-parse", "--show-toplevel") or path
+
+
+def worktrees(root):
+    out = git_out(root, "worktree", "list", "--porcelain") or ""
+    return [ln[9:] for ln in out.splitlines() if ln.startswith("worktree ") and ln[9:] != root]
+
+
+def under(path, roots):
+    return bool(path) and any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def repo_handoff(root, sessions, detailed=10):
+    """A handoff for a new session about everything done in a repository: the state it is in,
+    every conversation about it in either tool on every machine (what it set out to do, where
+    it ended, what it changed, what went wrong), the latest one in detail, what Claude remembers
+    about the project, and the commands that pull any detail on demand. -> (path, rows)"""
+    roots = [root] + worktrees(root)
+    mine = [s for s in sessions if under(s.get("cwd"), roots)]
+    rows = sorted(merge_rows(mine), key=lambda r: r["last"], reverse=True)
+    by_key = {(s.get("host"), s["id"]): s for s in mine}
+    hours = sum(r.get("active") or 0 for r in rows) / 3600
+    tools = sorted({app_of(m) for m in mine})
+    doc = [f"# Handoff: {os.path.basename(root)}",
+           f"Everything done in {root} so far: {len(rows)} conversations, {hours:.0f} hours of work, in "
+           + " and ".join(APP_LABEL[t] for t in tools) + (", on " + ", ".join(sorted({r['host'] for r in rows
+                                                                                         if r.get('host')}))
+                                                             + " and this machine" if any(r.get("host") for r in rows)
+                                                             else "")
+           + f". Written {datetime.now():%Y-%m-%d %H:%M}. This is the overview: the end of this file says "
+             "how to read any session in full."]
+    state = git_state(root)
+    if state:
+        branches = git_out(root, "for-each-ref", "--sort=-committerdate", "--count=8",
+                           "--format=    %(refname:short)  %(committerdate:relative)  %(subject)", "refs/heads")
+        trees = worktrees(root)
+        prs = None
+        if shutil.which("gh") and "github.com" in (git_out(root, "remote", "get-url", "origin") or ""):
+            try:
+                p = subprocess.run(["gh", "pr", "list", "--state", "open", "--limit", "10", "--json",
+                                    "number,title,headRefName"], cwd=root, capture_output=True, text=True, timeout=10)
+                prs = json.loads(p.stdout) if p.returncode == 0 else None
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                prs = None
+        doc.append("## The repository now\n\n" + state
+                   + (f"\n- Branches, latest first:\n{branches}" if branches else "")
+                   + (f"\n- Other worktrees: {', '.join(trees)}" if trees else "")
+                   + ("\n- Open pull requests:\n" + "\n".join(f"    #{p['number']} {p['title']} ({p['headRefName']})"
+                                                             for p in prs) if prs else ""))
+    mem = os.path.join(PROJECTS, encode_path(root), "memory", "MEMORY.md")
+    if os.path.isfile(mem):
+        with open(mem, errors="ignore") as f:
+            index = "".join(f.readlines()[:200]).strip()
+        if index:
+            doc.append(f"## What Claude remembers about this project\n\nThe index of {os.path.dirname(mem)}/ "
+                       f"(read a file there for the whole memory):\n\n{index}")
+    over = ["## The conversations, latest first"]
+    for n, r in enumerate(rows, 1):
+        members = [by_key.get((r.get("host"), c["id"])) or r for c in (r.get("chain") or [{"id": r["id"]}])]
+        items = []
+        if n <= detailed:
+            for m in members:
+                items += session_items(m)
+        apps = " → ".join(dict.fromkeys(APP_LABEL[app_of(m)] for m in members))
+        lines = [f"### {n}. {name(r)}",
+                 f"- {when(r['first'])} to {when(r['last'])}, {hm((r.get('active') or 0) / 60)} of work, "
+                 f"{r.get('user') or 0} prompts, in {apps}" + (f", on {r['host']}" if r.get("host") else ""),
+                 "- Sessions: " + ", ".join(f"`{m['id']}` ({APP_LABEL[app_of(m)]})" for m in members)]
+        if r.get("first_prompts"):
+            lines.append("- Set out to: " + fit(r["first_prompts"][0][1], 400))
+        if last_prompt(r) and r.get("user", 0) > 1:
+            lines.append("- Last asked: " + fit(last_prompt(r), 300))
+        ends = [x[2] for x in items if x[1] == "agent" and not x[2].startswith("**Subagent")]
+        if ends:
+            lines.append("- Ended with: " + fit(WS_RE.sub(" ", ends[-1].split(":** ", 1)[-1]), 1200))
+        elif r.get("last_said"):
+            lines.append("- Ended with: " + r["last_said"][1])
+        files = list(dict.fromkeys(reversed([x[2] for x in items if x[1] == "files"])))
+        inside = [os.path.relpath(p, t) for p in files for t in roots if under(p, [t])][:200]
+        if inside:
+            outside = len(files) - len(inside)
+            lines.append("- Changed: " + ", ".join(inside[:12]) + (f" and {len(inside) - 12} more" if len(inside) > 12 else "")
+                         + (f" (and {outside} files outside the repository)" if outside > 0 else ""))
+        errors = [x[2] for x in items if x[1] == "error"]
+        if errors:
+            lines.append("- Last problem: " + fit(errors[-1].lstrip("- "), 300))
+        if r.get("todo") and r["todo"].get("done", 0) < r["todo"].get("total", 0):
+            td = r["todo"]
+            lines.append(f"- Checklist: {td['done']} of {td['total']} done" + (f", on: {td['current']}" if td.get("current") else ""))
+        if r.get("broken"):
+            lines.append(f"- Note: its Codex thread is {r['broken']}")
+        over.append("\n".join(lines))
+    doc.append("\n\n".join(over))
+    if rows:
+        latest = rows[0]
+        if is_remote(latest):
+            dest = HOSTS.get(latest["host"], latest["host"])
+            p = subprocess.run(["ssh", *SSH_OPTS, dest, f"{REMOTE_S} transcript {latest['id']} --local"],
+                               capture_output=True, text=True, timeout=120)
+            detail = p.stdout.strip() if p.returncode == 0 else None
+        else:
+            detail = session_doc(latest, session_items(latest), 40000)
+        if detail:
+            doc.append("# The latest conversation in detail\n\n" + detail.replace("\n## ", "\n### ", 1))
+    doc.append("## Details on demand\n\n"
+               "Read any of these when a detail matters, instead of guessing:\n\n"
+               "- `s transcript <session id>`: a session as a document (where it ended, files it changed, "
+               "problems, the latest part of the conversation); add `--all` for all of it, `--grep WORDS` "
+               "for just the parts about something, `--since 2d` for the recent part. Works for sessions "
+               "on the other machine too.\n"
+               "- `s search WORDS`: every prompt about something, in every session.\n"
+               "- `git log -p -- PATH`, `git show COMMIT`, `git diff`: what actually changed.")
+    path = handoff_file(f"repo-{re.sub(r'[^A-Za-z0-9_.-]', '_', os.path.basename(root))}-{datetime.now():%Y%m%d-%H%M}")
+    with open(path, "w") as f:
+        f.write("\n\n".join(doc) + "\n")
+    return path, rows
+
+
+def repo_prompt(path, rows):
+    hours = sum(r.get("active") or 0 for r in rows) / 3600
+    return (f"Here is a handoff of the work on this repository so far ({len(rows)} conversation"
+            f"{'' if len(rows) == 1 else 's'} in Claude Code and Codex, {hours:.1f} hours of work): {path}. Read it. It is an overview, with the latest "
+            f"conversation in more detail, and its last section has the commands that pull any part of any "
+            f"session when you need a detail. Then tell me in a few lines what this repository is, what was "
+            f"being worked on, where it stands now, and what looks unfinished or fragile. Don't start new "
+            f"work until I say so.")
 
 
 # ----------------------------------------------------------------- live state
@@ -3256,7 +3630,7 @@ def resume(s, extra, dry_run, target=None, prepared=None):
                 else:
                     print(c("2", f"→ this conversation is ~{tokens // 1000}k tokens, more than Codex can take "
                                  f"whole, so Codex starts fresh on Claude's summary plus the recent part"))
-                    prepared = ("transcript", "<transcript>" if dry_run else claude_handoff(s, summary, entries))
+                    prepared = ("transcript", "<transcript>" if dry_run else claude_handoff(s))
             elif not native:
                 print(c("2", f"→ {'would write' if dry_run else 'writing'} the Codex transcript for Claude to read"))
                 prepared = ("transcript", "<transcript>" if dry_run else codex_handoff(s))
@@ -3547,6 +3921,8 @@ def main():
     ap.add_argument("rest", nargs="*")
     ap.add_argument("-d", "--days", type=int, default=None)
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--grep")
+    ap.add_argument("--since")
     ap.add_argument("-m", "--min", type=float, default=10)
     ap.add_argument("-a", "--all", action="store_true")
     ap.add_argument("--sort", choices=["recent", "active"], default="recent")
@@ -3577,7 +3953,7 @@ def main():
         return
     rest = a.rest
     if a.days is None:
-        a.days = 30 if rest[:1] == ["cost"] else 14
+        a.days = 30 if rest[:1] == ["cost"] else 90 if rest[:1] == ["handoff"] else 14
     if rest == ["update"]:
         self_update()
         return
@@ -3712,6 +4088,49 @@ def main():
         else:
             jobs_view(pool)
         return
+    if rest[:1] == ["transcript"] and len(rest) == 2:
+        transcript_cmd(find(view, sessions, rest[1]), a, (a.grep or "").lower().split())
+        return
+    if rest[:1] == ["handoff"] and len(rest) <= 2:
+        root = repo_root(rest[1] if len(rest) == 2 else os.getcwd())
+        there = sorted((s for s in sessions if is_remote(s) and under(s.get("cwd"), [root])),
+                       key=lambda s: s["last"], reverse=True)
+        if not os.path.isdir(root) and there:  # the repository lives on another machine: write it there
+            host = there[0]["host"]
+            args = ["handoff", root, "--local", "-d", str(a.days)] + (["--" + target] if target else []) + (
+                ["-p"] if a.print else []) + (["-n"] if a.dry_run else [])
+            dest = HOSTS.get(host, host)
+            print(c("2", f"→ {root} is on {host}; writing the handoff there"), file=sys.stderr)
+            os.execvp("ssh", ["ssh", "-t", *CONTROL_OPTS, dest, f'"$SHELL" -lic {shlex.quote(REMOTE_S + " " + shlex.join(args))}'])
+        print(c("2", f"reading every session about {root} ..."), file=sys.stderr)
+        path, rows = repo_handoff(root, sessions)
+        if not rows:
+            sys.exit(f"no sessions worked in {root} in the last {a.days} days (try -d 365)")
+        if a.print:
+            with open(path) as f:
+                print(f.read())
+            return
+        size = os.path.getsize(path)
+        print(c("1", f"Handoff for {os.path.basename(root)}") + c("2", f"  {path}  (about {size // 4:,} tokens)"))
+        for n, r in enumerate(rows[:8], 1):
+            print(f"  {n:>2}. {fit(name(r), 50):<50}  {app_cell(r):<8} {rel(r['last']):<8} {hm((r.get('active') or 0) / 60):>6}"
+                  + (c("35", f"  @{r['host']}") if r.get("host") else ""))
+        if len(rows) > 8:
+            print(c("2", f"      … and {len(rows) - 8} more"))
+        if not target:
+            print(c("2", "start a new session with it:  s handoff --claude   or   s handoff --codex"
+                         "   (or give any session that path)"))
+            return
+        prompt = repo_prompt(path, rows)
+        print(c("2", f"→ starting {APP_LABEL[target]} in {root} with it"))
+        if a.dry_run:
+            return
+        os.chdir(root)
+        os.environ["SESSIONS_CATCHUP_DONE"] = "1"
+        if target == "claude":
+            claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+            os.execvp(claude, [claude, "--add-dir=" + HANDOFF_DIR, *extra, prompt])
+        sys.exit(run_codex([shutil.which("codex") or "codex", *codex_args(), *extra, prompt]))
     if rest and rest[0] in ("show", "path") and len(rest) == 2:
         s = find(view, sessions, rest[1])
         if rest[0] == "show":
