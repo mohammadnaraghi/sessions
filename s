@@ -134,7 +134,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.13.1"
+VERSION = "0.14.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -1277,6 +1277,14 @@ def session_doc(s, items, budget=None, heading=None, since=None):
         files = ([p[len(home):] for p in files if p.startswith(home)] + [p for p in files if not p.startswith(home)])
         parts.append("### Files it changed (latest first)\n\n" + "\n".join(f"- {p}" for p in files[:40])
                      + (f"\n- … and {len(files) - 40} more" if len(files) > 40 else ""))
+    times = [x[0] for x in items if x[0]]
+    commits, changed = repo_changes(s.get("cwd"), min(times), max(times)) if times and not is_remote(s) else ([], [])
+    if commits or changed:
+        parts.append("### The repository while it worked\n\n(its shell commands included; so is anything else that "
+                     "ran at the same time)\n\n"
+                     + ("Commits:\n" + "\n".join(f"- {x}" for x in commits[:15]) + "\n\n" if commits else "")
+                     + ("Files:\n" + "\n".join(f"- {x}" for x in changed[:40])
+                        + (f"\n- … and {len(changed) - 40} more" if len(changed) > 40 else "") if changed else ""))
     errors = [x[2] for x in items if x[1] == "error"]
     if errors:
         parts.append("### Problems it hit (the latest)\n\n" + "\n".join(errors[-5:]))
@@ -1340,6 +1348,34 @@ def git_state(cwd, since=None):
     return "\n".join(lines)
 
 
+def repo_changes(cwd, start, end):
+    """What changed in cwd's repository while a session worked (start to end, unix times): the
+    commits made then, on any branch, and the uncommitted files last written then. Its own shell
+    commands show up here; so does anything else that ran at the same time. -> (commits, files),
+    files relative to the repository, or ([], []) outside one."""
+    root = git_out(cwd, "rev-parse", "--show-toplevel") if cwd and os.path.isdir(cwd) else None
+    if not root or not start:
+        return [], []
+    end = (end or start) + 300
+    log = git_out(root, "log", "--all", "--name-only", "--format=@@%h %ad %s", "--date=format:%b %d %H:%M",
+                  "--since=" + datetime.fromtimestamp(start - 60).isoformat(),
+                  "--until=" + datetime.fromtimestamp(end).isoformat()) or ""
+    commits, files = [], []
+    for line in log.splitlines():
+        if line.startswith("@@"):
+            commits.append(line[2:])
+        elif line.strip():
+            files.append(line.strip())
+    for line in (git_out(root, "status", "--porcelain") or "").splitlines():
+        path = line[3:].split(" -> ")[-1].strip('"')
+        try:
+            if start - 60 <= os.path.getmtime(os.path.join(root, path)) <= end:
+                files.append(path)
+        except OSError:
+            pass
+    return list(dict.fromkeys(commits)), list(dict.fromkeys(files))
+
+
 def handoff_file(stem):
     os.makedirs(HANDOFF_DIR, exist_ok=True)
     return os.path.join(HANDOFF_DIR, stem + ".md")
@@ -1390,26 +1426,45 @@ CAUGHT_UP = os.path.join(CACHE_DIR, "caught-up.json")  # session id -> when it w
 def caught_up(sid):
     try:
         with open(CAUGHT_UP) as f:
-            return json.load(f).get(sid)
+            mark = json.load(f).get(sid)
     except (OSError, ValueError, AttributeError):
         return None
+    return mark.get("through") if isinstance(mark, dict) else mark
 
 
-def mark_caught_up(sid, through):
+def chain_watch(target):
+    """The files of the other sessions of target's conversation on this machine: ai-bridge's
+    per-message hook only asks again when one of them changed."""
+    out = []
+    for ref in target.get("chain") or []:
+        m = SESSION_INDEX.get((target.get("host"), ref["id"]))
+        if m and m["id"] != target["id"] and not is_remote(m):
+            path = m.get("rollout") if app_of(m) == "codex" else m.get("path")
+            if path:
+                out.append(path)
+    return out
+
+
+def mark_caught_up(sid, through, watch=None):
     try:
         with open(CAUGHT_UP) as f:
             marks = json.load(f)
     except (OSError, ValueError):
         marks = {}
-    marks[sid] = through
+    old = marks.get(sid) if isinstance(marks.get(sid), dict) else {}
+    marks[sid] = {"through": through, "watch": watch if watch is not None else old.get("watch", []),
+                  "checked": time.time()}
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(CAUGHT_UP + ".tmp", "w") as f:
         json.dump(marks, f)
     os.replace(CAUGHT_UP + ".tmp", CAUGHT_UP)
 
 
-def last_turn(s):
-    """Unix time of a session's last real turn (a resume writes lines of its own first)."""
+def last_turn(s, live=False):
+    """Unix time of a session's last real turn (a resume writes lines of its own first; `live`: its
+    last reply, as the message being sent may be written already)."""
+    if app_of(s) == "claude" and live and s.get("last_said"):
+        return parse_ts(s["last_said"][0]).timestamp()
     if app_of(s) == "claude":
         times = [t for t in (s.get("last_prompt_ts"), (s.get("last_said") or [None])[0]) if t]
         if times:
@@ -1417,14 +1472,14 @@ def last_turn(s):
     return parse_ts(s.get("last_done") or s["last"]).timestamp()
 
 
-def catchup(target, write=True):
+def catchup(target, write=True, live=False):
     """What the rest of target's conversation did that target has not seen: every other session
     of it in either tool, each as a document (where it ended, what it changed, what went wrong,
     the conversation), oldest first, then the working tree now with the commits since.
     -> {"text", "path", "tools", "inline", "through"} or None. Not seen: since target was last
     caught up, else since its own last turn."""
     through = time.time()
-    since = caught_up(target["id"]) or last_turn(target)
+    since = caught_up(target["id"]) or last_turn(target, live)
     sources = []
     for ref in target.get("chain") or []:
         m = SESSION_INDEX.get((target.get("host"), ref["id"]))
@@ -1470,9 +1525,12 @@ def catchup_prompt(cu):
             f"still open. Don't start new work until I say so.")
 
 
-def catchup_context(cu):
-    """The same for a session resumed some other way, as context its start hook adds (ai-bridge)."""
-    head = (f"Since this session's last turn, the user continued this conversation in {cu['tools']}. "
+def catchup_context(cu, live=False):
+    """The same for a session resumed some other way, as context ai-bridge's hooks add: as it
+    starts, or (`live`) with the message the user is sending."""
+    head = (f"Since your last reply in this session, the user continued this conversation in {cu['tools']}. "
+            f"Take it into account: the message they are sending may build on it." if live else
+            f"Since this session's last turn, the user continued this conversation in {cu['tools']}. "
             f"Take it into account: their next message may build on it.")
     if cu["inline"]:
         return head + "\n\n" + cu["text"]
@@ -1918,7 +1976,11 @@ def repo_handoff(root, sessions, detailed=10):
         elif r.get("last_said"):
             lines.append("- Ended with: " + r["last_said"][1])
         files = list(dict.fromkeys(reversed([x[2] for x in items if x[1] == "files"])))
-        inside = [os.path.relpath(p, t) for p in files for t in roots if under(p, [t])][:200]
+        times = [x[0] for x in items if x[0]]
+        if times:  # what its shell commands changed shows up in the repository
+            files += [os.path.join(root, p) for p in repo_changes(root, min(times), max(times))[1]]
+            files = list(dict.fromkeys(files))
+        inside = list(dict.fromkeys(os.path.relpath(p, t) for p in files for t in roots if under(p, [t])))[:200]
         if inside:
             outside = len(files) - len(inside)
             lines.append("- Changed: " + ", ".join(inside[:12]) + (f" and {len(inside) - 12} more" if len(inside) > 12 else "")
@@ -2407,6 +2469,12 @@ def hosts_setup(label, dest):
                           'else echo "ai-bridge: copied; run ai-bridge setup there to share memory with Codex"; fi',
                     timeout=60)
             print((p.stdout or "") + (p.stderr or ""), end="")
+            # MCP servers that sign in there (each machine keeps its own sign-ins)
+            p = ssh(dest, 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
+                          'grep -q ai-bridge ~/.codex/hooks.json 2>/dev/null && ai-bridge mcp-login --check', timeout=240)
+            if p.returncode == 1 and p.stdout.strip():
+                print("\n".join("mcp: " + ln for ln in p.stdout.strip().splitlines() if not ln.startswith("Checking"))
+                      + f"\n     to sign in there: ssh -t {dest} .local/bin/ai-bridge mcp-login")
         p = ssh(dest, "chmod +x ~/.local/bin/s && ~/.local/bin/s --version && "
                       "(nohup ~/.local/bin/s --local -a -p >/dev/null 2>&1 &) && "  # the first long read, now
                       "(command -v python3 >/dev/null 2>&1 || echo 'warning: python3 missing there') && "
@@ -3656,7 +3724,7 @@ def resume(s, extra, dry_run, target=None, prepared=None):
         os.chdir(s.get("cwd") or HOME)
         os.environ["SESSIONS_CATCHUP_DONE"] = "1"  # s settled it: ai-bridge's start hook adds nothing
         if prepared and prepared[0] == "catchup" and native:
-            mark_caught_up(s["id"], prepared[1]["through"])
+            mark_caught_up(s["id"], prepared[1]["through"], chain_watch(s))
     if target == "codex" and not is_remote(s) and os.path.basename(argv[0]) == "codex":
         sys.exit(run_codex(argv))
     os.execvp(argv[0], argv)
@@ -4063,10 +4131,15 @@ def main():
 
     sessions, notes = gather(a.days)
     a.rescan = False  # once is enough when the picker reaches further back
-    if rest[:1] == ["_catchup"] and len(rest) == 2:  # ai-bridge's start hook, as a session resumes
+    if rest[:1] == ["_catchup"] and len(rest) in (2, 3):  # ai-bridge's hooks: a session resumes, or
+        live = rest[2:] == ["live"]                            # (live) the user sends it a message
         target = SESSION_INDEX.get((None, rest[1]))
-        cu = catchup(target) if target and target.get("chain") else None
-        print(json.dumps({"context": catchup_context(cu), "through": cu["through"]} if cu else {}))
+        now = time.time()
+        cu = catchup(target, live=live) if target and target.get("chain") else None
+        answer = {"through": cu["through"] if cu else now, "watch": chain_watch(target) if target else []}
+        if cu:
+            answer["context"] = catchup_context(cu, live)
+        print(json.dumps(answer))
         return
     if notes and not a.json:
         for n in notes:

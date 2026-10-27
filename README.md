@@ -192,8 +192,18 @@ Any session can also be continued in the other tool:
 With `ai-bridge` set up, the same catch-up happens however you open a session: `claude
 --resume`, `codex resume`, or the ChatGPT app. As a session resumes, its start hook asks `s`
 what the rest of the conversation did since that session was last caught up, and adds it to
-the session's context. So you can go Claude, then Codex, then Claude again, each in its own
-window, and every return starts from the whole story.
+the session's context. A session you keep open gets it too: when you send it a message after
+working in the other tool, a per-message hook adds what happened there to that message. It
+costs nothing when nothing happened: the hook only looks at whether the other sessions' files
+changed, and asks `s` when one did (or every few minutes). So you can keep Claude and Codex open
+side by side, or go Claude, then Codex, then Claude again, and every turn starts from the whole
+story. Codex asks you once to review its new hooks (`/hooks`, or "Trust all and continue" when
+it starts); `s sync` then carries that approval to your other machine.
+
+What a catch-up holds for each other session: where it ended, the files it changed, what
+changed in the repository while it worked (commits and uncommitted files, which covers edits
+made through shell commands), the problems it hit, its subagents' reports, Claude's own summary
+of any part left out, and as much of the conversation as fits; then the working tree now.
 
 A conversation that moved between the tools stays one row, marked `⇄`, with the work of both
 added up. Its number always opens wherever you worked on it last, in that tool, so you never
@@ -226,8 +236,12 @@ From then on there is nothing to run. You start `claude` or `codex` as usual, an
   memories are added to its memory, and Claude is told about them.
 - **One set of MCP servers.** The MCP servers you add to Claude Code are copied into Codex: your
   own ones into `~/.codex/config.toml`, a project's `.mcp.json` and local servers into that
-  project's `.codex/config.toml` (kept out of git). Servers that log in with OAuth need
-  `codex mcp login NAME` once.
+  project's `.codex/config.toml` (kept out of git). Servers that sign in with OAuth need a
+  sign-in once per tool and per machine: `ai-bridge mcp-login` signs both tools in to every one
+  that needs it. On another machine run it over `ssh -t`: no browser opens there, so you open
+  the link it prints, sign in, and paste back the address you land on (a Mac's keychain, where
+  the sign-ins are kept, is locked over ssh until you unlock it, which it offers to do).
+  `s hosts setup` tells you which servers still need a sign-in there.
 - **Pick up where the other left off.** A session you resume is told what its conversation
   did in the other tool (or another session) since it last saw it, without asking. A new
   session is told about the other tool's latest session in the folder; ask it to continue where
@@ -242,6 +256,7 @@ From then on there is nothing to run. You start `claude` or `codex` as usual, an
 | `to-codex` · `to-claude` | continue this folder's latest session in the other tool (like `s N --codex` / `--claude`) |
 | `cx` | `codex` with the bridge's profile, from shells other than zsh |
 | `ai-bridge sync` | copy Claude's MCP servers into Codex now |
+| `ai-bridge mcp-login` | sign both tools in to every MCP server that needs it here (`--check` to only list them) |
 | `ai-bridge update` | the latest release (`s update` does this too) |
 
 ### Which memory is which
@@ -263,8 +278,8 @@ memory. Account memory only affects the chat apps, so turn it on or off for them
 have more than one ChatGPT account, each keeps its own.
 
 Setup links those commands next to `ai-bridge` and edits, after backing each one up as
-`*.bak-ai-bridge-<time>`: a SessionStart hook in `~/.claude/settings.json`, a SessionStart hook
-in `~/.codex/hooks.json` (Codex asks you to trust it the first time), a marked block in
+`*.bak-ai-bridge-<time>`: SessionStart and UserPromptSubmit hooks in `~/.claude/settings.json`,
+the same two in `~/.codex/hooks.json` (Codex asks you to trust them the first time), a marked block in
 `~/.zshrc`, and `~/.codex/config.toml` (Codex may write its memories, and reads `CLAUDE.md` when
 a repository has no `AGENTS.md`). To undo it, remove those hook entries and the marked blocks.
 `s hosts setup NAME` copies `ai-bridge` to that machine as well and refreshes it there when it

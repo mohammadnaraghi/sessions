@@ -10,7 +10,9 @@ Nothing to run day to day once set up: start `claude` or `codex` as usual.
     folder; Codex is told about the latest Claude session. Say "continue where
     Codex/Claude left off" and they read the other's transcript. A session that
     resumes after its conversation went on elsewhere is told what happened there
-    (ai-bridge asks `s`), whichever way it was opened.
+    (ai-bridge asks `s`), whichever way it was opened, and so is a session left
+    open while you worked in the other tool, with the next message you send it
+    (a UserPromptSubmit hook in both tools).
   - Claude's MCP servers are copied into Codex's config (user scope into
     ~/.codex/config.toml, a project's .mcp.json and local servers into
     <project>/.codex/config.toml). Add or remove MCP servers in Claude.
@@ -27,6 +29,10 @@ Optional commands
   mem pull [-n] [--all] copy Codex's new memories into Claude's memory now
   mem show              print exactly what Codex is given at session start
   ai-bridge sync        copy Claude's MCP servers into Codex now
+  ai-bridge mcp-login [--check]
+                        sign Claude Code and Codex in to every MCP server that
+                        needs it here (over ssh: paste back the address you
+                        land on; a locked keychain is unlocked first)
   ai-bridge claude-transcript [id] / codex-transcript [thread]
                         print a session as markdown (what the tools read)
 
@@ -60,7 +66,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/ai-bridge"
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -962,18 +968,143 @@ def hook_payload():
         return {}
 
 
-def mark_caught_up(sid, through):
-    """Note for `s` when a session was last told the rest of its conversation (its caught-up.json)."""
-    path = Path(os.environ.get("SESSIONS_CACHE_DIR") or HOME / ".cache" / "sessions") / "caught-up.json"
+CAUGHT_UP = Path(os.environ.get("SESSIONS_CACHE_DIR") or HOME / ".cache" / "sessions") / "caught-up.json"
+RECHECK = 300  # seconds: the per-message hook asks `s` again at least this often
+
+
+def read_marks():
     try:
-        marks = json.loads(path.read_text())
+        return json.loads(CAUGHT_UP.read_text())
     except (OSError, ValueError):
-        marks = {}
-    marks[sid] = through
+        return {}
+
+
+def mark_caught_up(sid, through, watch=None):
+    """Note for `s` (its caught-up.json) when a session was last told the rest of its conversation,
+    and which other sessions' files to watch for news."""
+    path = CAUGHT_UP
+    marks = read_marks()
+    old = marks.get(sid) if isinstance(marks.get(sid), dict) else {}
+    marks[sid] = {"through": through, "watch": watch if watch is not None else old.get("watch", []),
+                  "checked": time.time()}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(marks))
     os.replace(str(tmp), str(path))
+
+
+def ask_s(sid, live=False, timeout=10):
+    """`s _catchup <id>` -> {"through", "watch", "context"?} or None when s is missing or slow (left to
+    finish on its own, so its caches are ready next time)."""
+    s = SCRIPT.parent / "s"
+    if not s.is_file():
+        s = Path(shutil.which("s") or "/nonexistent")
+    if not s.is_file():
+        return None
+    try:
+        p = subprocess.Popen([sys.executable, str(s), "_catchup", sid, *(["live"] if live else []),
+                              "--local", "-d", "60"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        out, _ = p.communicate(timeout=timeout)
+        return json.loads(out or "{}") or None
+    except subprocess.TimeoutExpired:
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_prompt_hook():
+    """Both tools' UserPromptSubmit hook: when the rest of this conversation went on in the other
+    tool (or another session) since this session last heard of it, add what happened to the
+    message being sent, so two windows open side by side stay in step. Quick when nothing did:
+    it looks only at the other sessions' files, and asks `s` when one changed or every few
+    minutes."""
+    payload = hook_payload()
+    sid = payload.get("session_id")
+    if not sid:
+        return 0
+    mark = read_marks().get(sid)
+    if isinstance(mark, dict) and time.time() - (mark.get("checked") or 0) < RECHECK:
+        def newer(p):
+            try:
+                return os.path.getmtime(p) > (mark.get("through") or 0)
+            except OSError:
+                return False
+        if not any(newer(p) for p in mark.get("watch") or []):
+            return 0
+    answer = ask_s(sid, live=True, timeout=8)
+    if not answer:
+        return 0
+    mark_caught_up(sid, answer.get("through") or time.time(), answer.get("watch") or [])
+    if answer.get("context"):
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                 "additionalContext": answer["context"]}}))
+    return 0
+
+
+def keychain_locked():
+    """macOS over ssh: is the login keychain (where both tools keep MCP sign-ins) out of reach?"""
+    if sys.platform != "darwin":
+        return False
+    p = subprocess.run(["security", "show-keychain-info"], capture_output=True, text=True)
+    return p.returncode != 0 and "interaction is not allowed" in (p.stderr + p.stdout)
+
+
+def mcp_needing_login():
+    """[(tool, server)] for MCP servers that sign in with OAuth and have no sign-in here."""
+    todo = []
+    if shutil.which("codex"):
+        try:
+            p = subprocess.run(["codex", "mcp", "list", "--json"], capture_output=True, text=True, timeout=60)
+            todo += [("codex", x["name"]) for x in json.loads(p.stdout or "[]")
+                     if x.get("auth_status") == "not_logged_in"]
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    if shutil.which("claude"):
+        try:
+            p = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True, timeout=180, cwd=str(HOME))
+        except (OSError, subprocess.TimeoutExpired):
+            p = None
+        for line in (p.stdout if p else "").splitlines():
+            name, _, rest = line.partition(": ")
+            state = rest.rsplit(" - ", 1)[-1] if " - " in rest else ""
+            if name and ("Needs authentication" in state or "stored credentials" in state):
+                todo.append(("claude", name))
+    return todo
+
+
+def cmd_mcp_login(args):
+    """Sign Claude Code and Codex in to every MCP server that needs it on this machine, one after
+    the other. Over ssh no browser opens here: open the link it prints anywhere, sign in, and
+    paste back the address you land on."""
+    over_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+    os.environ["PATH"] = os.pathsep.join([str(HOME / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+                                          os.environ.get("PATH", "")])  # a bare ssh shell lacks them
+    if over_ssh and keychain_locked():
+        if "--check" in args:
+            print("This machine's keychain is locked over ssh, so its MCP sign-ins can't be read from here. "
+                  "Run `ai-bridge mcp-login` in a terminal there (or over ssh -t, to unlock it).")
+            return 1
+        print("The keychain, where Claude Code and Codex keep MCP sign-ins, is locked over ssh. "
+              "Unlocking it (your login password for this machine):")
+        if subprocess.run(["security", "unlock-keychain", str(HOME / "Library/Keychains/login.keychain-db")]).returncode:
+            raise BridgeError("could not unlock the keychain")
+    print("Checking which MCP servers need a sign-in ...")
+    todo = mcp_needing_login()
+    if not todo:
+        print("Every MCP server that signs in has a sign-in here.")
+        return 0
+    for tool, name in todo:
+        print("  %s: %s" % ("Claude Code" if tool == "claude" else "Codex", name))
+    if "--check" in args:
+        print("Sign in to them with: ai-bridge mcp-login")
+        return 1
+    for tool, name in todo:
+        print("\n== %s: %s" % ("Claude Code" if tool == "claude" else "Codex", name))
+        subprocess.run([tool, "mcp", "login", name] + (["--no-browser"] if over_ssh else []))
+    left = mcp_needing_login()
+    print("\nDone." if not left else "\nStill without a sign-in: " + ", ".join("%s %s" % x for x in left))
+    return 0 if not left else 1
 
 
 def resume_catchup(payload):
@@ -983,24 +1114,12 @@ def resume_catchup(payload):
     SESSIONS_CATCHUP_DONE when it already put that in the session's first message."""
     if payload.get("source") != "resume" or not payload.get("session_id") or os.environ.get("SESSIONS_CATCHUP_DONE"):
         return None
-    s = SCRIPT.parent / "s"
-    if not s.is_file():
-        s = Path(shutil.which("s") or "/nonexistent")
-    if not s.is_file():
+    answer = ask_s(payload["session_id"])
+    if not answer:
         return None
-    try:
-        p = subprocess.Popen([sys.executable, str(s), "_catchup", payload["session_id"], "--local", "-d", "60"],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             text=True, start_new_session=True)
-        out, _ = p.communicate(timeout=10)
-        answer = json.loads(out or "{}") or {}
-        if answer.get("context"):  # handed over now: what it covers counts as seen from here on
-            mark_caught_up(payload["session_id"], answer["through"])
-        return answer.get("context")
-    except subprocess.TimeoutExpired:
-        return None  # s is reading everything after an update: it finishes on its own, ready next time
-    except (OSError, ValueError):
-        return None  # never hold up a session over this
+    # handed over now: what it covers counts as seen from here on, and the watch list is fresh
+    mark_caught_up(payload["session_id"], answer.get("through") or time.time(), answer.get("watch") or [])
+    return answer.get("context")
 
 
 def cmd_codex_hook():
@@ -1337,6 +1456,15 @@ def cmd_setup(args=()):
         starts.append({"matcher": "startup|resume|clear|compact",
                        "hooks": [{"type": "command", "command": hook_cmd, "timeout": 15,
                                   "additionalContextLimit": 12000}]})
+    prompt_cmd = '"%s" "%s" prompt-hook' % (python, SCRIPT)
+    prompts = data["hooks"].setdefault("UserPromptSubmit", [])
+    ours = [h for group in prompts for h in group.get("hooks", []) if "prompt-hook" in h.get("command", "")]
+    if ours:
+        for h in ours:
+            h["command"] = prompt_cmd
+    else:
+        prompts.append({"hooks": [{"type": "command", "command": prompt_cmd, "timeout": 15,
+                                   "additionalContextLimit": 12000}]})
     rendered = json.dumps(data, indent=2) + "\n"
     if not hooks_path.exists() or hooks_path.read_text() != rendered:
         hooks_path.write_text(rendered)
@@ -1375,6 +1503,16 @@ def cmd_setup(args=()):
             h["command"] = claude_cmd
     else:
         starts.append({"hooks": [{"type": "command", "command": claude_cmd, "timeout": 20}]})
+        changed = True
+    claude_prompt = '[ -f "%s" ] && "%s" "%s" prompt-hook || true' % (SCRIPT, python, SCRIPT)
+    prompts = settings["hooks"].setdefault("UserPromptSubmit", [])
+    ours = [h for group in prompts for h in group.get("hooks", []) if "prompt-hook" in h.get("command", "")]
+    if ours:
+        changed = changed or any(h["command"] != claude_prompt for h in ours)
+        for h in ours:
+            h["command"] = claude_prompt
+    else:
+        prompts.append({"hooks": [{"type": "command", "command": claude_prompt, "timeout": 15}]})
         changed = True
     if changed:
         backup(CLAUDE_SETTINGS, stamp)
@@ -1446,6 +1584,7 @@ def main(argv):
         "sync": cmd_sync,
         "claude-transcript": cmd_claude_transcript,
         "codex-transcript": cmd_codex_transcript,
+        "mcp-login": cmd_mcp_login,
     }
     if prog == "cx":
         return launch(["codex", "-p", ASTRA_PROFILE] + args, Path.cwd(), False)
@@ -1455,6 +1594,12 @@ def main(argv):
         return cmd_codex_hook()
     if prog == "claude-hook":
         return cmd_claude_hook()
+    if prog == "prompt-hook":
+        try:
+            return cmd_prompt_hook()
+        except Exception as exc:  # never hold up a message over this
+            sys.stderr.write("ai-bridge prompt-hook: %s\n" % exc)
+            return 0
     if prog == "setup":
         return cmd_setup(args)
     if prog == "update":
