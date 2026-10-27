@@ -152,8 +152,16 @@ Any session can also be continued in the other tool:
 - `s 3 --claude` (or `c 3`) writes the Codex conversation out as a transcript and starts
   Claude Code in the same folder, asking it to read the transcript and say where things stand.
 - When the conversation already has a session in the tool you pick (it came from there, or
-  went there before), that session is resumed instead of starting a new one. If you worked in
-  the other tool since, it also gets a transcript of just that part to read first.
+  went there before), that session is resumed instead of starting a new one. It keeps its own
+  full history, and gets just what the rest of the conversation did since it last saw it: from
+  every other session of it, in either tool, oldest first. A short catch-up is in its first
+  message; a long one is a file it reads.
+
+With `ai-bridge` set up, the same catch-up happens however you open a session: `claude
+--resume`, `codex resume`, or the ChatGPT app. As a session resumes, its start hook asks `s`
+what the rest of the conversation did since that session was last caught up, and adds it to
+the session's context. So you can go Claude, then Codex, then Claude again, each in its own
+window, and every return starts from the whole story.
 
 A conversation that moved between the tools stays one row, marked `⇄`, with the work of both
 added up. Its number always opens wherever you worked on it last, in that tool, so you never
@@ -188,8 +196,10 @@ From then on there is nothing to run. You start `claude` or `codex` as usual, an
   own ones into `~/.codex/config.toml`, a project's `.mcp.json` and local servers into that
   project's `.codex/config.toml` (kept out of git). Servers that log in with OAuth need
   `codex mcp login NAME` once.
-- **Pick up where the other left off.** Each tool is told about the other's latest session in
-  the folder; ask it to continue where Claude or Codex left off and it reads the transcript.
+- **Pick up where the other left off.** A session you resume is told what its conversation
+  did in the other tool (or another session) since it last saw it, without asking. A new
+  session is told about the other tool's latest session in the folder; ask it to continue where
+  Claude or Codex left off and it reads the transcript.
 - **Your model by default.** In zsh, `codex` starts with the bridge's profile (GPT-6 Astra, or
   the `--model` you gave setup), and so do the Codex sessions `s` starts.
 

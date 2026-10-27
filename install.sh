@@ -42,6 +42,9 @@ install_one() {
 
 install_one s
 install_one ai-bridge
+# read every session once now, in the background, so the first `s` (and ai-bridge's catch-up
+# when a session resumes) needs no long first pass
+( "$BIN_DIR/s" --local -a -p >/dev/null 2>&1 & )
 
 if grep -q ai-bridge "$HOME/.codex/hooks.json" 2>/dev/null; then
   "$BIN_DIR/ai-bridge" setup >/dev/null && echo "ai-bridge: setup refreshed"

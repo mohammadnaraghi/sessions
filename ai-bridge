@@ -8,7 +8,9 @@ Nothing to run day to day once set up: start `claude` or `codex` as usual.
   - Claude pulls that inbox into its memory when it starts (a Claude
     SessionStart hook), and is told about the latest Codex session in the
     folder; Codex is told about the latest Claude session. Say "continue where
-    Codex/Claude left off" and they read the other's transcript.
+    Codex/Claude left off" and they read the other's transcript. A session that
+    resumes after its conversation went on elsewhere is told what happened there
+    (ai-bridge asks `s`), whichever way it was opened.
   - Claude's MCP servers are copied into Codex's config (user scope into
     ~/.codex/config.toml, a project's .mcp.json and local servers into
     <project>/.codex/config.toml). Add or remove MCP servers in Claude.
@@ -58,7 +60,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/ai-bridge"
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -938,8 +940,50 @@ def hook_payload():
         return {}
 
 
+def mark_caught_up(sid, through):
+    """Note for `s` when a session was last told the rest of its conversation (its caught-up.json)."""
+    path = Path(os.environ.get("SESSIONS_CACHE_DIR") or HOME / ".cache" / "sessions") / "caught-up.json"
+    try:
+        marks = json.loads(path.read_text())
+    except (OSError, ValueError):
+        marks = {}
+    marks[sid] = through
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(marks))
+    os.replace(str(tmp), str(path))
+
+
+def resume_catchup(payload):
+    """When a session resumes after the rest of its conversation went on in the other tool (or
+    another session), what happened there since its last turn, from `s` (the sessions picker
+    installed beside this script): text to add to its context, or None. `s` sets
+    SESSIONS_CATCHUP_DONE when it already put that in the session's first message."""
+    if payload.get("source") != "resume" or not payload.get("session_id") or os.environ.get("SESSIONS_CATCHUP_DONE"):
+        return None
+    s = SCRIPT.parent / "s"
+    if not s.is_file():
+        s = Path(shutil.which("s") or "/nonexistent")
+    if not s.is_file():
+        return None
+    try:
+        p = subprocess.Popen([sys.executable, str(s), "_catchup", payload["session_id"], "--local", "-d", "60"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, start_new_session=True)
+        out, _ = p.communicate(timeout=10)
+        answer = json.loads(out or "{}") or {}
+        if answer.get("context"):  # handed over now: what it covers counts as seen from here on
+            mark_caught_up(payload["session_id"], answer["through"])
+        return answer.get("context")
+    except subprocess.TimeoutExpired:
+        return None  # s is reading everything after an update: it finishes on its own, ready next time
+    except (OSError, ValueError):
+        return None  # never hold up a session over this
+
+
 def cmd_codex_hook():
-    cwd = Path(hook_payload().get("cwd") or os.getcwd())
+    payload = hook_payload()
+    cwd = Path(payload.get("cwd") or os.getcwd())
     try:
         sync_mcp(cwd)  # takes effect from Codex's next start
     except Exception as exc:
@@ -948,12 +992,19 @@ def cmd_codex_hook():
         sys.stdout.write(codex_context(cwd))
     except Exception as exc:  # never block Codex from starting
         sys.stderr.write("ai-bridge hook: %s\n" % exc)
+    caught_up = resume_catchup(payload)
+    if caught_up:
+        sys.stdout.write("\n# Where this conversation went while you were away\n\n" + caught_up + "\n")
     return 0
 
 
 def cmd_claude_hook():
-    cwd = Path(hook_payload().get("cwd") or os.getcwd())
+    payload = hook_payload()
+    cwd = Path(payload.get("cwd") or os.getcwd())
     parts = []
+    caught_up = resume_catchup(payload)
+    if caught_up:
+        parts.append(caught_up)
     try:
         pulled = pull([project_key(project_root(cwd))], dry_run=False, quiet=True)
         if pulled:
@@ -967,7 +1018,7 @@ def cmd_claude_hook():
     except Exception as exc:
         sys.stderr.write("ai-bridge mcp sync: %s\n" % exc)
     try:
-        thread = find_codex_thread(cwd)
+        thread = None if caught_up else find_codex_thread(cwd)
         if thread and time.time() - (thread.get("updated_at") or 0) < RECENT_DAYS * 86400:
             parts.append("The user also works with Codex (GPT) in this folder. Their latest "
                          "Codex session: \"%s\", last active %s. If the user wants to "

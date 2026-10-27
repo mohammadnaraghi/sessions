@@ -16,7 +16,8 @@ Usage
                          Claude -> Codex imports the full conversation as a Codex
                          thread; Codex -> Claude hands Claude its transcript. If
                          the conversation has a session in that tool already, it
-                         resumes that one, with a transcript of what happened since.
+                         resumes that one and tells it what the rest of the
+                         conversation did since it last saw it (in any session).
                          A conversation continued that way stays one row (⇄);
                          its number opens wherever you worked on it last.
   s <session id>         open exactly that session, even inside such a chain
@@ -123,7 +124,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -144,7 +145,7 @@ GAP = 30 * 60  # silence longer than this is not counted as work
 CRON_LIFETIME = timedelta(days=7)  # recurring in-session jobs auto-expire after this
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 CODEX_CACHE = os.path.join(CACHE_DIR, "codex.json")
-CODEX_CACHE_VERSION = 5
+CODEX_CACHE_VERSION = 6
 HANDOFF_DIR = os.path.join(CACHE_DIR, "handoffs")  # transcripts handed from one tool to the other
 HANDOFF_MAX = 60_000
 # Codex models read about 272k tokens. A Claude conversation bigger than this is not imported
@@ -884,6 +885,8 @@ def codex_state(row, text):
             a = v[0] or start or v[1]
             if a:
                 turn(a, v[1])
+                # the last finished turn: Codex runs a resumed thread's start hook as the next one begins
+                st["last_done"] = iso(max(a, v[1] or a))
             start, err = None, v[2]
         elif kind == "model":
             model = v or model
@@ -1086,17 +1089,20 @@ def handoff_file(sid, since):
     return os.path.join(HANDOFF_DIR, stem + ".md")
 
 
-def codex_handoff(s, since=None):
-    """Write a Codex thread's transcript for Claude to read: its most recent part, or only the turns
-    after `since` (unix time). -> path, or None when nothing happened after `since`."""
+def codex_turns(s, since=None):
+    """[(unix time, markdown)], one per turn of a Codex thread, only those after `since` if given."""
     turns = []
     for kind, t, v in codex_events(read_rollout(s.get("rollout")) or ""):
         if kind == "start" or not turns:
             turns.append([t, []])
         turns[-1][1] += codex_lines(kind, v)
-    if since is not None:
-        turns = [x for x in turns if (x[0] or 0) > since]
-    texts = ["\n\n".join(lines) for _, lines in turns if lines]
+    return [(t or 0, "\n\n".join(lines)) for t, lines in turns if lines and (since is None or (t or 0) > since)]
+
+
+def codex_handoff(s, since=None):
+    """Write a Codex thread's transcript for Claude to read: its most recent part, or only the turns
+    after `since` (unix time). -> path, or None when nothing happened after `since`."""
+    texts = [text for _, text in codex_turns(s, since)]
     if since is not None and not texts:
         return None
     kept, size = [], 0
@@ -1130,11 +1136,112 @@ def handoff_prompt(path, source="codex", title=None):
             f"still open. Don't start new work until I say so.")
 
 
-def catchup_prompt(path, source):
-    tool = "Codex (GPT)" if source == "codex" else "Claude Code"
-    return (f"Since your last turn here, this conversation continued in {tool}; what happened there is in "
-            f"{path}. Read it, then tell me in a few lines where things stand now and what is still "
-            f"open. Don't start new work until I say so.")
+CATCHUP_INLINE = 8000  # a catch-up this short goes straight into the prompt; a longer one is a file
+CAUGHT_UP = os.path.join(CACHE_DIR, "caught-up.json")  # session id -> when it was last told the rest
+# of its conversation (s writes it when it passes a catch-up on, ai-bridge when its start hook does)
+
+
+def caught_up(sid):
+    try:
+        with open(CAUGHT_UP) as f:
+            return json.load(f).get(sid)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def mark_caught_up(sid, through):
+    try:
+        with open(CAUGHT_UP) as f:
+            marks = json.load(f)
+    except (OSError, ValueError):
+        marks = {}
+    marks[sid] = through
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(CAUGHT_UP + ".tmp", "w") as f:
+        json.dump(marks, f)
+    os.replace(CAUGHT_UP + ".tmp", CAUGHT_UP)
+
+
+def last_turn(s):
+    """Unix time of a session's last real turn (a resume writes lines of its own first)."""
+    if app_of(s) == "claude":
+        times = [t for t in (s.get("last_prompt_ts"), (s.get("last_said") or [None])[0]) if t]
+        if times:
+            return max(parse_ts(t).timestamp() for t in times)
+    return parse_ts(s.get("last_done") or s["last"]).timestamp()
+
+
+def catchup(target, write=True):
+    """What the rest of target's conversation did that target has not seen, in every other session
+    of it in either tool, oldest first: {"text", "path", "tools", "inline", "through"} or None. Not
+    seen: since it was last caught up, else since its own last turn."""
+    through = time.time()
+    since, items, sources = caught_up(target["id"]) or last_turn(target), [], {}
+    for ref in target.get("chain") or []:
+        m = SESSION_INDEX.get((target.get("host"), ref["id"]))
+        if not m or m["id"] == target["id"] or parse_ts(m["last"]).timestamp() <= since + 1:
+            continue
+        if app_of(m) == "codex":
+            turns = codex_turns(m, since)
+        else:
+            turns = [e for e in read_claude(m["path"])[2] if (e[0] or 0) > since]
+        if turns:
+            sources[m["id"]] = m
+            items += [(t or 0, m["id"], text) for t, text in turns]
+    if not items:
+        return None
+    items.sort(key=lambda x: x[0])
+    kept, size = [], 0
+    for item in reversed(items):
+        if kept and size + len(item[2]) > HANDOFF_MAX:
+            break
+        kept.append(item)
+        size += len(item[2])
+    kept.reverse()
+    out, current = [f"# This conversation since {when(iso(since))}"], None
+    if len(kept) < len(items):
+        out.append("(the earliest part is left out)")
+    for _, sid, text in kept:
+        if sid != current:
+            m = sources[sid]
+            out.append(f"## In {APP_LABEL[app_of(m)]}: \"{name(m)}\" (`{sid}`)")
+            current = sid
+        out.append(text)
+    text = "\n\n".join(out) + "\n"
+    latest = max(sources.values(), key=lambda m: m["last"])
+    path = os.path.join(HANDOFF_DIR, f"{datetime.now():%Y%m%d-%H%M}-{latest['id']}.md")  # names a session it came from
+    if write:
+        os.makedirs(HANDOFF_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+    tools = []
+    for m in sorted(sources.values(), key=lambda m: m["last"]):
+        label = ("another Claude Code session" if app_of(m) == app_of(target)
+                 else "Codex (GPT)" if app_of(m) == "codex" else "Claude Code")
+        if label not in tools:
+            tools.append(label)
+    return {"text": text, "path": path, "tools": " and ".join(tools), "inline": len(text) <= CATCHUP_INLINE,
+            "through": through}
+
+
+def catchup_prompt(cu):
+    """The first message of a resumed session that the rest of its conversation moved past."""
+    if cu["inline"]:
+        return (f"Since your last turn here, this conversation continued in {cu['tools']}. This is what "
+                f"happened there:\n\n{cu['text']}\nTell me in a few lines where things stand now and what is "
+                f"still open. Don't start new work until I say so.")
+    return (f"Since your last turn here, this conversation continued in {cu['tools']}; what happened there "
+            f"is in {cu['path']}. Read it, then tell me in a few lines where things stand now and what is "
+            f"still open. Don't start new work until I say so.")
+
+
+def catchup_context(cu):
+    """The same for a session resumed some other way, as context its start hook adds (ai-bridge)."""
+    head = (f"Since this session's last turn, the user continued this conversation in {cu['tools']}. "
+            f"Take it into account: their next message may build on it.")
+    if cu["inline"]:
+        return head + "\n\n" + cu["text"]
+    return head + f" What happened there is in {cu['path']}; read it before you answer their next message."
 
 
 def read_claude(path):
@@ -1923,6 +2030,7 @@ def hosts_setup(label, dest):
                     timeout=60)
             print((p.stdout or "") + (p.stderr or ""), end="")
         p = ssh(dest, "chmod +x ~/.local/bin/s && ~/.local/bin/s --version && "
+                      "(nohup ~/.local/bin/s --local -a -p >/dev/null 2>&1 &) && "  # the first long read, now
                       "(command -v python3 >/dev/null 2>&1 || echo 'warning: python3 missing there') && "
                       "if command -v tmux >/dev/null 2>&1 || [ -x /opt/homebrew/bin/tmux ]; "
                       "then echo 'tmux: installed'; "
@@ -2824,13 +2932,13 @@ def local_argv(s, target, extra, prepared=None):
         claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
         # --add-dir=DIR, not --add-dir DIR: it takes any number of folders and would take the prompt too
         if app_of(s) == "claude" and kind == "catchup":
-            return [claude, "--resume", s["id"], "--add-dir=" + HANDOFF_DIR, *extra, catchup_prompt(value, "codex")]
+            return [claude, "--resume", s["id"], "--add-dir=" + HANDOFF_DIR, *extra, catchup_prompt(value)]
         if app_of(s) == "claude":
             return [claude, "--resume", s["id"], *extra]
         return [claude, "--add-dir=" + HANDOFF_DIR, *extra, handoff_prompt(value, "codex", s.get("custom_title") or s.get("ai_title"))]
     codex = shutil.which("codex") or "codex"
     if app_of(s) == "codex" and kind == "catchup":
-        return [codex, *codex_args(), "resume", s["id"], *extra, catchup_prompt(value, "claude")]
+        return [codex, *codex_args(), "resume", s["id"], *extra, catchup_prompt(value)]
     if app_of(s) == "codex":
         return [codex, *codex_args(), "resume", s["id"], *extra]
     if kind == "thread":
@@ -3110,36 +3218,23 @@ def chain_member(s, target):
     return None
 
 
-def continue_in(s, member, extra, dry_run):
-    """Resume `member`, the conversation's own session in the other tool, and when s (newer) went
-    on without it, hand it what happened in s since."""
-    since = parse_ts(member["last"]).timestamp()
-    there, here = APP_LABEL[app_of(member)], APP_LABEL[app_of(s)]
-    prepared = None
-    if parse_ts(s["last"]).timestamp() > since + 1:
-        print(c("2", f"→ resuming this conversation's {there} session {member['id'][:8]}; "
-                     f"{'would write' if dry_run else 'writing'} what happened in {here} since for it to read"))
-        if dry_run:
-            path = "<transcript>"
-        elif app_of(s) == "codex":
-            path = codex_handoff(s, since)
-        else:
-            path = claude_handoff(s, None, read_claude(s["path"])[2], since)
-        if path:
-            prepared = ("catchup", path)
-            r = running_of(member)
-            if r and r.get("tmux"):
-                print(c("33", f"note: it is already running; tell it to read {path}"))
-    resume(member, extra, dry_run, prepared=prepared)
-
-
 def resume(s, extra, dry_run, target=None, prepared=None):
     target = target or app_of(s)
-    native = target == app_of(s)
-    if not native and not is_remote(s):  # a remote session's own s does this there
+    if target != app_of(s) and not is_remote(s):  # (a remote session's own s does this there)
         member = chain_member(s, target)
-        if member:
-            return continue_in(s, member, extra, dry_run)
+        if member:  # the conversation's own session in that tool
+            print(c("2", f"→ resuming this conversation's {APP_LABEL[target]} session {member['id'][:8]}"))
+            s = member
+    native = target == app_of(s)
+    if native and not is_remote(s) and prepared is None and s.get("chain"):
+        cu = catchup(s, write=not dry_run)
+        if cu:  # the rest of the conversation went on without it
+            print(c("2", f"→ it gets what happened since in {cu['tools']} "
+                         + ("in its first message" if cu["inline"] else f"to read ({cu['path']})")))
+            prepared = ("catchup", cu)
+            r = running_of(s)
+            if r and r.get("tmux"):
+                print(c("33", f"note: it is already running; tell it to read {cu['path']}"))
     r = running_of(s) if native else None
     if not is_remote(s):
         cwd = s.get("cwd")
@@ -3181,6 +3276,9 @@ def resume(s, extra, dry_run, target=None, prepared=None):
         return
     if not is_remote(s):
         os.chdir(s.get("cwd") or HOME)
+        os.environ["SESSIONS_CATCHUP_DONE"] = "1"  # s settled it: ai-bridge's start hook adds nothing
+        if prepared and prepared[0] == "catchup" and native:
+            mark_caught_up(s["id"], prepared[1]["through"])
     if target == "codex" and not is_remote(s) and os.path.basename(argv[0]) == "codex":
         sys.exit(run_codex(argv))
     os.execvp(argv[0], argv)
@@ -3585,6 +3683,11 @@ def main():
 
     sessions, notes = gather(a.days)
     a.rescan = False  # once is enough when the picker reaches further back
+    if rest[:1] == ["_catchup"] and len(rest) == 2:  # ai-bridge's start hook, as a session resumes
+        target = SESSION_INDEX.get((None, rest[1]))
+        cu = catchup(target) if target and target.get("chain") else None
+        print(json.dumps({"context": catchup_context(cu), "through": cu["through"]} if cu else {}))
+        return
     if notes and not a.json:
         for n in notes:
             print(c("33", n), file=sys.stderr)
