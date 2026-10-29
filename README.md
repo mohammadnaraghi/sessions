@@ -131,7 +131,9 @@ The first search reads your whole history once, a few seconds. After that a sear
 fraction of a second, because `s` keeps an index of your prompts (`~/.cache/sessions/prompts.json`)
 and only reads what was added since.
 
-The list itself covers the last two weeks. Type `o` in the picker (or `n` past the last page) to
+The list itself covers the last two weeks, and sessions with at least ten minutes of work; a
+shorter one is listed for a day after you last used it, so a quick question you just asked is
+easy to get back to (`-a` lists every session, however short). Type `o` in the picker (or `n` past the last page) to
 reach further back: 30 days, 90 days, a year, then everything. With fzf it is alt-o.
 
 ## Every detail of a session

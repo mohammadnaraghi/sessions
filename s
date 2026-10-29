@@ -10,7 +10,8 @@ which sessions are running right now and what they are doing, and which ones
 set up cron jobs.
 
 Usage
-  s                      interactive picker (last 14 days, >= 10 min of work)
+  s                      interactive picker (last 14 days, >= 10 min of work;
+                         shorter ones for a day after you last used them)
   s 3                    resume the 3rd session in that list, in its own tool
   s 3 --codex            continue it in Codex instead (--claude: in Claude Code).
                          Claude -> Codex imports the full conversation as a Codex
@@ -83,7 +84,8 @@ Memories and configs between machines
 
 Options
   -d, --days N           look back N days (default 14; 30 for s cost)
-  -m, --min N            minimum active minutes to be listed (default 10)
+  -m, --min N            minimum active minutes to be listed (default 10); a
+                         shorter session is listed for a day after its last turn
   -a, --all              list every session touched in the window
   --sort recent|active   order by last activity (default) or by work time
   --local                this machine only, skip configured hosts
@@ -134,7 +136,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import quote
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/s"
 
 
@@ -3144,6 +3146,9 @@ def import_cmd():
 
 # ----------------------------------------------------------------- selection
 
+SHORT_GRACE = timedelta(days=1)  # a session under the minimum work still shows this long after its last turn
+
+
 def select(sessions, days, min_active, sort):
     now = datetime.now(timezone.utc)
     cutoff_day = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -3154,8 +3159,8 @@ def select(sessions, days, min_active, sort):
             continue
         s["active_win"] = sum(v for d, v in s["days"].items() if d >= cutoff_day) / 60
         s["days_win"] = sorted(d for d, v in s["days"].items() if d >= cutoff_day and v >= 60)
-        if s["active_win"] < min_active:
-            continue
+        if s["active_win"] < min_active and last < now - SHORT_GRACE:
+            continue  # short, and not touched for a day
         view.append(s)
     if sort == "active":
         view.sort(key=lambda s: -s["active_win"])
