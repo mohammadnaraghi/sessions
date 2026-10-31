@@ -13,7 +13,8 @@ Nothing to run day to day once set up: start `claude` or `codex` as usual.
     (ai-bridge asks `s`), whichever way it was opened, and so is a session left
     open while you worked in the other tool, with the next message you send it
     (a UserPromptSubmit hook in both tools).
-  - Claude's MCP servers are copied into Codex's config (user scope into
+  - Claude's MCP servers (and those of the plugins you turned on) are copied
+    into Codex's config (user scope into
     ~/.codex/config.toml, a project's .mcp.json and local servers into
     <project>/.codex/config.toml). Add or remove MCP servers in Claude.
   - In zsh, `codex` starts the bridge's Codex profile (GPT-6 Astra unless setup
@@ -66,7 +67,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.9.0"
 UPDATE_URL = "https://raw.githubusercontent.com/mohammadnaraghi/sessions/main/ai-bridge"
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
@@ -761,6 +762,33 @@ def codex_server(cfg, cwd=None):
     return None, "unknown server type %s" % kind
 
 
+def plugin_mcp():
+    """MCP servers that the Claude Code plugins turned on bring along (Stripe's, say): Codex gets
+    them too. A plugin keeps them in .mcp.json in its install folder."""
+    try:
+        enabled = [k for k, v in (json.loads(CLAUDE_SETTINGS.read_text()).get("enabledPlugins") or {}).items() if v]
+    except (OSError, ValueError, AttributeError):
+        return {}
+    try:
+        installed = json.loads((HOME / ".claude" / "plugins" / "installed_plugins.json").read_text()).get("plugins") or {}
+    except (OSError, ValueError, AttributeError):
+        installed = {}
+    out = {}
+    for plugin in enabled:
+        for record in installed.get(plugin) or []:
+            root = record.get("installPath")
+            try:
+                data = json.loads((Path(root) / ".mcp.json").read_text()) if root else {}
+            except (OSError, ValueError):
+                continue
+            servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
+            for name, server in servers.items():
+                if isinstance(server, dict):  # a plugin's own files are referred to through its root
+                    out.setdefault(name, json.loads(json.dumps(server).replace("${CLAUDE_PLUGIN_ROOT}", root)))
+            break
+    return out
+
+
 def claude_mcp(cwd):
     """(user servers, project servers, project folder) as Claude sees them from cwd."""
     try:
@@ -782,7 +810,7 @@ def claude_mcp(cwd):
         project.update({k: v for k, v in servers.items() if k not in disabled})
     for place in places:  # `claude mcp add` without --scope (local scope)
         project.update((projects.get(place) or {}).get("mcpServers") or {})
-    return data.get("mcpServers") or {}, project, top
+    return dict(plugin_mcp(), **(data.get("mcpServers") or {})), project, top
 
 
 def write_mcp_block(path, servers, notes):
@@ -988,7 +1016,7 @@ def mark_caught_up(sid, through, watch=None):
     marks[sid] = {"through": through, "watch": watch if watch is not None else old.get("watch", []),
                   "checked": time.time()}
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
     tmp.write_text(json.dumps(marks))
     os.replace(str(tmp), str(path))
 
@@ -1078,6 +1106,10 @@ def cmd_mcp_login(args):
     the other. Over ssh no browser opens here: open the link it prints anywhere, sign in, and
     paste back the address you land on."""
     over_ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+    if "--check" not in args and not sys.stdin.isatty():
+        raise BridgeError("signing in needs a terminal you can type into (a password, pasted addresses): "
+                          "run it in Terminal or Warp, not through Claude Code's ! prompt or a plain ssh "
+                          "command (for another machine: ssh -t HOST .local/bin/ai-bridge mcp-login)")
     os.environ["PATH"] = os.pathsep.join([str(HOME / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
                                           os.environ.get("PATH", "")])  # a bare ssh shell lacks them
     if over_ssh and keychain_locked():
@@ -1237,11 +1269,21 @@ def claude_handoff(source, summary):
     return out
 
 
+def to_tool_with_s(sid, tool, show):
+    """Continue a session in the other tool through `s`, which passes the most context. Returns
+    only when s is not installed beside this script."""
+    s = SCRIPT.parent / "s"
+    if s.is_file():
+        os.execv(sys.executable, [sys.executable, str(s), sid, "--" + tool, "--local", "-a", "-d", "365",
+                                  *(["-n"] if show else [])])
+
+
 def cmd_to_codex(args):
     show = "--print" in args
     rest = [a for a in args if a != "--print"]
     cwd = Path.cwd().resolve()
     source = find_claude_session(rest[0] if rest else None, cwd).resolve()
+    to_tool_with_s(source.stem, "codex", show)
     work = session_cwd(source) or cwd
     if not work.is_dir():
         work = cwd
@@ -1285,6 +1327,9 @@ def cmd_to_claude(args):
     no_pull = "--no-pull" in args
     rest = [a for a in args if a not in ("--print", "--no-pull")]
     cwd = Path.cwd().resolve()
+    found = find_codex_thread(cwd, rest[0] if rest else None)
+    if found:
+        to_tool_with_s(found["id"], "claude", show)
     text, thread, work = codex_transcript(cwd, rest[0] if rest else None)
     when = datetime.datetime.fromtimestamp(thread.get("updated_at") or time.time())
     HANDOFFS.mkdir(parents=True, exist_ok=True)

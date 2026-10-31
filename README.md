@@ -104,16 +104,14 @@ about everything done there, in Claude Code and Codex, on every machine:
 - what Claude remembers about the project
 - every conversation about it, latest first: what it set out to do, what you last asked, where it
   ended, the files it changed, the last problem it hit, an unfinished checklist
-- the latest conversation in more detail
+- as many conversations in detail as the new session can hold, latest first
 - how to read any detail on demand
 
-It is an overview on purpose: big enough to know what happened and where things stand, small
-enough to read at once. A detail is one command away, `s transcript <session id>`: a session as a
-document (where it ended, files it changed, problems it hit, the latest part of the
-conversation), with `--all` for all of it, `--grep WORDS` for the parts about something and
-`--since 2d` for the recent part, for sessions on any machine in either tool. `s handoff
---claude` (or `--codex`) starts the new session with it and asks it to say what the repository
-is, where it stands and what looks unfinished or fragile.
+Anything else is one command away, `s transcript <session id>`, for sessions on any machine in
+either tool: `--all` for all of it with tool output in full, `--grep WORDS` for the parts about
+something, `--subagents` for its subagents' work and `--since 2d` for the recent part. `s handoff
+--claude` (or `--codex`) starts the new session with it, sized for that tool, and asks it to say what
+the repository is, where it stands and what looks unfinished or fragile.
 
 ## Find anything you ever asked
 
@@ -177,19 +175,64 @@ the rest out. Picking a session runs `codex resume` in its folder.
 
 Any session can also be continued in the other tool:
 
-- `s 3 --codex` (or `x 3` in the picker) imports a Claude conversation into Codex as a new
-  thread, with the whole history, using Codex's own importer, and opens it. A conversation too
-  big for Codex to take whole (over about 150k tokens; Codex models read about 272k) starts a
-  fresh Codex thread on Claude's own summary of the earlier work plus the most recent part.
-- `s 3 --claude` (or `c 3`) writes the Codex conversation out as a transcript and starts
-  Claude Code in the same folder, asking it to read the transcript and say where things stand.
+- `s 3 --codex` (or `x 3` in the picker) imports a Claude conversation into Codex as a real
+  thread, using Codex's own importer: every message and tool call, and each tool result up to
+  about 4,000 characters. A conversation too big for Codex (it reads about 258k tokens) imports
+  its latest part, about 120k tokens, opening with Claude's own summary and the prompt being
+  worked on, and hands Codex the rest as files.
+- `s 3 --claude` (or `c 3`) starts Claude Code in the same folder on files holding the
+  conversation. Claude has no importer, but it reads far more (about 1M tokens).
 - When the conversation already has a session in the tool you pick (it came from there, or
   went there before), that session is resumed instead of starting a new one. It keeps its own
-  full history, and gets just what the rest of the conversation did since it last saw it: from
-  every other session of it, in either tool, oldest first. For each one: where it ended, the
-  files it changed, the problems it hit, Claude's own summary of any part left out, and the
-  conversation; then the working tree now and the commits since. A short catch-up is in its
-  first message; a long one is a file it reads, and `s transcript` pulls any part in full.
+  full history, and gets what the rest of the conversation did since it last saw it. A short
+  catch-up is in its first message; a long one is files it reads.
+
+### How much context goes across
+
+Handoffs pass as much as each tool can hold while leaving it room to work: up to about 400k tokens
+for Claude and 170k for Codex, less when a resumed session is already full. Set
+`SESSIONS_HANDOFF_TOKENS` to change the limit.
+
+| | Claude Code | Codex |
+|---|---|---|
+| Reads | about 1M tokens | about 258k tokens |
+| A handoff fills up to | about 400k tokens | about 170k tokens, import included |
+| How it gets there | numbered files, read in full | a real imported thread, then files |
+
+The files cover every session of the conversation, latest first, with the working tree on top:
+branch, commits and the uncommitted diff (`.env` files and `secrets/` folders left out). For each session:
+
+- **Where it ended:** your last message and its last reply.
+- **What it produced:** Claude artifacts with their links, pull requests, releases and whatever else it
+  published, the files it named, and every link in the conversation.
+- **Files from temporary folders:** a scratchpad gets emptied, so what a session made there is copied beside
+  the handoff, and rebuilt from the transcript if it has gone already.
+- **What is still open:** its to-do list and the scheduled jobs it set up.
+- **What changed:** the files it and its subagents changed, marked if they are gone now, and what changed in
+  the repository while it worked.
+- **What went wrong:** the problems it hit.
+- **Images:** the ones you attached and the screenshots it took, or looked at in Codex.
+- **Claude's summaries:** all of them, as each one loses some of the one before.
+- **The conversation.**
+
+The conversation holds everything you said: messages sent while the agent was working, your answers to its
+questions, the calls you stopped and why, your `!` commands with what they printed, and slash commands
+with their words. For the agent, it holds full commands, the diff of every edit, the files it wrote, the briefs it
+gave subagents and their reports (background agents' too), and in Codex its file diffs, scripts and what they returned.
+
+Rather than losing older turns, detail fades with age, and what you said goes last:
+
+1. The latest part is complete, with tool output and reasoning.
+2. Older, it has replies, tool calls and the start of what each call did.
+3. Older still, what you said and the reply that ended each turn.
+4. The oldest is what you said.
+
+An import into Codex now carries your mid-turn messages and background agents' reports as well, which the importer
+alone would drop, and always comes with a file of what an import can't carry. Plain secrets (API keys, tokens,
+passwords, private keys) are removed from everything that goes across, since the other tool is another company's.
+
+Nothing is out of reach. `s transcript <id> --all` prints a whole session with tool output in full,
+`--grep WORDS` finds the parts about something, and `--subagents` adds its subagents' work.
 
 With `ai-bridge` set up, the same catch-up happens however you open a session: `claude
 --resume`, `codex resume`, or the ChatGPT app. As a session resumes, its start hook asks `s`
@@ -202,10 +245,7 @@ side by side, or go Claude, then Codex, then Claude again, and every turn starts
 story. Codex asks you once to review its new hooks (`/hooks`, or "Trust all and continue" when
 it starts); `s sync` then carries that approval to your other machine.
 
-What a catch-up holds for each other session: where it ended, the files it changed, what
-changed in the repository while it worked (commits and uncommitted files, which covers edits
-made through shell commands), the problems it hit, its subagents' reports, Claude's own summary
-of any part left out, and as much of the conversation as fits; then the working tree now.
+A catch-up holds the same as a handoff, for the part that session hasn't seen.
 
 A conversation that moved between the tools stays one row, marked `⇄`, with the work of both
 added up. Its number always opens wherever you worked on it last, in that tool, so you never
